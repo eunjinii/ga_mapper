@@ -6,16 +6,34 @@ import math
 import random
 import numpy as np
 import csv
+import re
 from functools import reduce
 from multiprocessing import Pool, cpu_count
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
 
-layer_list = ['CONV', 'GEMM', 'FC']
-RESULT_DIR = 'out'
-if not os.path.exists(RESULT_DIR):
-    os.makedirs(RESULT_DIR)
+def extract_dimensions(file_path):
+    dimensions = {}
+    pattern = re.compile(r"Dimensions\s*{([^}]+)}")
 
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+        
+        match = pattern.search(content)
+        if match:
+            dim_str = match.group(1).strip()
+            # Extract key-value pairs
+            dim_pairs = re.findall(r"(\w+):\s*(\d+)", dim_str)
+            dimensions = {key: int(value) for key, value in dim_pairs}
+        
+        print(f"Extracted Dimensions: {dimensions}")
+        return dimensions
+
+    except FileNotFoundError:
+        print(f"File {file_path} not found.")
+        return {}
+    
 class GAMAPPER:
     def __init__(self, hw_config_file='', model_name='',fitness=['utilization', 'edp'], popluation_size=100, max_generations=10, alpha=0.7, beta=0.3):
         super(GAMAPPER,self).__init__()
@@ -51,8 +69,8 @@ class GAMAPPER:
         
     def run_maestro_to_get_all_metrics(self, mapping_file_path):
         try:
-            if os.path.exists('combined_model_mapping.csv'):
-                os.remove('combined_model_mapping.csv')
+            if os.path.exists(f'{self.model_name}_mapping.csv'):
+                os.remove(f'{self.model_name}_mapping.csv')
             command = [
                 './maestro',
                 f"--HW_file=data/hw/{self.hw_config_file}.m",
@@ -76,10 +94,9 @@ class GAMAPPER:
             if result.returncode != 0:
                 raise RuntimeError(f"MAESTRO failed with error: {result.stderr}")
             
-            result_csv = "combined_model_mapping.csv"
+            result_csv = f"{self.model_name}_mapping.csv"
             
             if os.path.exists(result_csv):
-                # print(f"Results saved in {result_csv}")
                 return result_csv
             else:
                 print("CSV file not generated.")
@@ -90,13 +107,6 @@ class GAMAPPER:
             return None
 
     def select_parents(self, population, fitness_scores,tournament_size=3):
-        # def tournament_selection():
-        #     competitors = random.sample(list(zip(population, fitness_scores)), tournament_size)
-        #     competitors.sort(key=lambda x: x[1], reverse=True)
-        #     return competitors[0][0]
-
-        # parent1 = tournament_selection()
-        # parent2 = tournament_selection()
         def normalize_fitness_scores(fitness_scores):
             Rw = min(fitness_scores)
             Rb = max(fitness_scores)
@@ -111,7 +121,6 @@ class GAMAPPER:
 
     def get_fitness_scores(self, csv_file_path):
         try:
-            # 데이터 로드 및 공백 제거
             df = pd.read_csv(csv_file_path)
             df.columns = df.columns.str.strip()
 
@@ -171,8 +180,6 @@ class GAMAPPER:
         """
         mapping_file_path = self.create_mapping_file(
             population,
-            layer_name="CONV",
-            layer_type="CONV",
             dimensions=self.dimensions,
             model_name=self.model_name
         )
@@ -315,7 +322,7 @@ class GAMAPPER:
         l1_mapper = self.encode_mapper(self.dimensions, level='l1')
         return l2_mapper + l1_mapper
 
-    def create_mapping_file(self, population, layer_name, layer_type, dimensions, model_name):
+    def create_mapping_file(self, population, dimensions, model_name):
         """
             Create mapping files for only an evaluation
         """
@@ -325,8 +332,8 @@ class GAMAPPER:
         dataflow_template = ''
         
         for idx, mapper in enumerate(population):
-            dataflow_template += f"\tLayer {layer_name}{idx} {{\n"
-            dataflow_template += f"\t\tType: {layer_type}\n"
+            dataflow_template += f"\tLayer CONV{idx} {{\n"
+            dataflow_template += f"\t\tType: CONV\n"
             dimensions_str = ', '.join([f"{k}:{v}" for k, v in dimensions.items()])
             dataflow_template += f"\t\tDimensions {{ {dimensions_str} }}\n"
             dataflow_template += "\t\tDataflow {\n"
@@ -590,21 +597,23 @@ class GAMAPPER:
         population = self.initialize_population()
         best_fitness, best_idx = -1, -1
         
-        result_csv = "combined_model_mapping.csv"
+        result_csv = f"{self.model_name}_mapping.csv"
         if os.path.exists(result_csv):
             os.remove(result_csv)
 
         no_improvement_generations = 0
         last_best_fitness = -float('inf')
         
+        fitness_scores, performance_list = self.evaluate_population(population)
+        best_fitness, best_idx = self.find_best_score(fitness_scores)
+        best_utilization, best_edp = performance_list[best_idx]
+        elite_individual = population[best_idx]
+        
         for i in range(self.max_generations): # Number of generations
             print(f"Generation {i + 1}......")
             
             # Step1: Evaluate population
-            fitness_scores, performance_list = self.evaluate_population(population)
-            best_fitness, best_idx = self.find_best_score(fitness_scores)
-            best_utilization, best_edp = performance_list[best_idx]
-            elite_individual = population[best_idx]
+
             
             # Track stagnation and apply restart if needed
             if best_fitness <= last_best_fitness:
@@ -642,6 +651,11 @@ class GAMAPPER:
             print("\telite_individual", elite_individual)
             population[0] = elite_individual
 
+            fitness_scores, performance_list = self.evaluate_population(population)
+            best_fitness, best_idx = self.find_best_score(fitness_scores)
+            best_utilization, best_edp = performance_list[best_idx]
+            elite_individual = population[best_idx]
+
             self.best_fitness = best_fitness
             self.best_utilization = best_utilization
             self.best_edp = best_edp
@@ -653,31 +667,35 @@ class GAMAPPER:
             'Best Fitness Score': self.best_fitness_score_list,
             'Best Utilization': self.best_utilization_list,
             'Best EDP': self.best_edp_list
-        }, 'conv_layer')
+        }, self.model_name)
 
         return population, best_fitness, best_idx
 
 if __name__ == "__main__":
-    conv_layer = {'K': 256, 'C': 128, 'R': 3, 'S': 3, 'Y': 14, 'X': 14}
-    gemm_layer = {'K': 512, 'C': 512, 'R': 1, 'S': 1, 'Y': 256, 'X': 1 }
-    fc_layer = {'K': 256, 'C': 1024, 'R': 1, 'S': 1, 'Y': 1, 'X': 1}
-    
-    model_name = 'combined_model'
+    model_name = 'single_layer_conv' # {'single_layer_conv', 'single_layer_gemm', 'single_layer_fc', 'multi_layer'}
     hardware_config = 'accelerator_edge'
+    
+    conv_layer = extract_dimensions(f'data/model/{model_name}.m') 
+    # CONV - {'K': 256, 'C': 128, 'R': 3, 'S': 3, 'Y': 14, 'X': 14}
+    # GEMM - {'K': 512, 'C': 512, 'R': 1, 'S': 1, 'Y': 256, 'X': 1 }
+    # FC - {'K': 256, 'C': 1024, 'R': 1, 'S': 1, 'Y': 1, 'X': 1}
     
     model = GAMAPPER(
         hw_config_file=hardware_config,
         model_name=model_name,
         fitness=['utilization', 'edp'],
-        popluation_size=150,
-        max_generations=50,
+        popluation_size=10,
+        max_generations=5,
         alpha=0.7, beta=0.3
     )
     population, best_score, best_idx = model.run_ga(dimensions=conv_layer)
-    print(population[best_idx])
+    print("Best mapper: ", population[best_idx])
     
     # Run the last best individual
-    final_mapping_file_path = model.create_mapping_file([population[best_idx]], layer_name="CONV", layer_type="CONV", dimensions=conv_layer, model_name=f'final_result_conv_layer')
+    best_mapper = population[best_idx]
+    # best_mapper = [[['P', 113], ['C', 1], ['K', 154], ['X', 1], ['R', 3], ['Y', 9], ['S', 3], ['P', 5], ['X', 1], ['R', 3], ['S', 3], ['Y', 4], ['K', 1], ['C', 1]]]
+    final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=conv_layer, model_name=f'final_result_{model_name}')
+
     final_result_csv = model.run_maestro_to_get_all_metrics(final_mapping_file_path)
     print(f'Final result saved in {final_result_csv}')
     
