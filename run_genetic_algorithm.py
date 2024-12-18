@@ -13,34 +13,44 @@ from sklearn.preprocessing import StandardScaler
 from datetime import datetime
 
 def extract_dimensions(file_path):
-    dimensions = {}
+    """
+        Return a list of dictionaries containing the dimensions of the DNN layers
+        CONV - [{'K': 256, 'C': 128, 'R': 3, 'S': 3, 'Y': 14, 'X': 14}]
+        GEMM - [{'K': 512, 'C': 512, 'R': 1, 'S': 1, 'Y': 256, 'X': 1 }]
+        FC - [{'K': 256, 'C': 1024, 'R': 1, 'S': 1, 'Y': 1, 'X': 1}]
+        multi_layers - [{'K': 256, 'C': 128, 'R': 3, 'S': 3, 'Y': 14, 'X': 14}, {'K': 512, 'C': 512, 'R': 1, 'S': 1, 'Y': 256, 'X': 1 }, {'K': 256, 'C': 1024, 'R': 1, 'S': 1, 'Y': 1, 'X': 1}]
+    """
+    dimensions_list = []
     pattern = re.compile(r"Dimensions\s*{([^}]+)}")
 
     try:
         with open(file_path, 'r') as f:
             content = f.read()
+
+        # Extract all matches for multi-layer or single-layer
+        matches = pattern.findall(content)
+
+        if matches:
+            for match in matches:
+                dim_pairs = re.findall(r"(\w+):\s*(\d+)", match.strip())
+                dimensions = {key: int(value) for key, value in dim_pairs}
+                dimensions_list.append(dimensions)
         
-        match = pattern.search(content)
-        if match:
-            dim_str = match.group(1).strip()
-            # Extract key-value pairs
-            dim_pairs = re.findall(r"(\w+):\s*(\d+)", dim_str)
-            dimensions = {key: int(value) for key, value in dim_pairs}
-        
-        print(f"Extracted Dimensions: {dimensions}")
-        return dimensions
+        print(f"Extracted Dimensions: {dimensions_list}")
+        return dimensions_list if dimensions_list else [{}]
 
     except FileNotFoundError:
         print(f"File {file_path} not found.")
-        return {}
+        return [{}]
     
 class GAMAPPER:
-    def __init__(self, hw_config_file='', model_name='',fitness=['utilization', 'edp'], popluation_size=100, max_generations=10, alpha=0.7, beta=0.3):
+    def __init__(self, hw_config_file='', model_name='', fitness=['utilization', 'edp'], popluation_size=100, max_generations=10, alpha=0.7, beta=0.3):
         super(GAMAPPER,self).__init__()
         self.hw_config_file = hw_config_file
         self.hw_mapping_file = f'{model_name}_mapping'
         self.model_name = model_name
-        self.fitness = fitness
+        self.fitness1 = fitness[0]
+        self.fitness2 = fitness[1]
         self.alpha = alpha
         self.beta = beta
 
@@ -51,22 +61,18 @@ class GAMAPPER:
                     self.num_PEs = int(line.split(":")[1])
                     print(f"Number of PEs: {self.num_PEs}")
 
-        self.result_dir = 'out'
         self.dimensions = {}
         self.popluation_size = popluation_size
         self.max_generations = max_generations
         
-        # initialize self.best_fitness, self.best_utilization, self.best_edp
         self.best_fitness = -1
-        self.best_utilization = 0
-        self.best_edp = float('inf')
+        self.best_perf_fitness1 = 0
+        self.best_perf_fitness2 = float('inf')
         
-        self.best_fitness_score_list = []
-        self.best_utilization_list = []
-        self.best_edp_list = []
+        self.best_fitness_score_list = [] # [fitness score] * generation size
+        self.best_perf_fitness1_list = [] # [metric1 value] * generation size
+        self.best_perf_fitness2_list = [] # [metric2 value] * generation size
 
-        os.makedirs(self.result_dir, exist_ok=True)
-        
     def run_maestro_to_get_all_metrics(self, mapping_file_path):
         try:
             if os.path.exists(f'{self.model_name}_mapping.csv'):
@@ -75,7 +81,6 @@ class GAMAPPER:
                 './maestro',
                 f"--HW_file=data/hw/{self.hw_config_file}.m",
                 f"--Mapping_file={mapping_file_path}",
-                # f"--Mapping_file=data/mapping/{self.hw_mapping_file}.m",
                 "--print_res=true",
                 "--print_res_csv_file=true",
                 "--print_log_file=true"
@@ -94,7 +99,7 @@ class GAMAPPER:
             if result.returncode != 0:
                 raise RuntimeError(f"MAESTRO failed with error: {result.stderr}")
             
-            result_csv = f"{self.model_name}_mapping.csv"
+            result_csv = f"{self.model_name}_mapping.csv" # might has some delay here, but it's fine
             
             if os.path.exists(result_csv):
                 return result_csv
@@ -106,65 +111,87 @@ class GAMAPPER:
             print(f"Error running MAESTRO: {e.stderr}")
             return None
 
-    def select_parents(self, population, fitness_scores,tournament_size=3):
-        def normalize_fitness_scores(fitness_scores):
-            Rw = min(fitness_scores)
-            Rb = max(fitness_scores)
+    def select_parents(self, population, pop_fitness_score_list,tournament_size=3):
+        def normalize_pop_fitness_score_list(pop_fitness_score_list):
+            Rw = min(pop_fitness_score_list)
+            Rb = max(pop_fitness_score_list)
             if Rw == Rb:  # Prevent division by zero
-                return [1.0 for _ in fitness_scores]
-            normalized_fitness_scores = [(Ri - Rw) + (Rb - Rw)/3 for Ri in fitness_scores]
-            return normalized_fitness_scores
+                return [1.0 for _ in pop_fitness_score_list]
+            normalized_pop_fitness_score_list = [(Ri - Rw) + (Rb - Rw)/3 for Ri in pop_fitness_score_list]
+            return normalized_pop_fitness_score_list
         
-        normalized_fitness_scores = normalize_fitness_scores(fitness_scores)
-        parents = random.choices(population, weights=normalized_fitness_scores, k=2)
+        normalized_pop_fitness_score_list = normalize_pop_fitness_score_list(pop_fitness_score_list)
+        parents = random.choices(population, weights=normalized_pop_fitness_score_list, k=2)
         return parents
 
-    def get_fitness_scores(self, csv_file_path):
+    def fetch_metric_by_name(self, df_row, fitness_string='utilization'):
+        """
+        Fetches the metric value from the DataFrame row based on the metric name.
+        Normalized metric_value range is [0, 1]
+        """
+        metric_value = None
+        normalized_metric_value = None
+        
+        if fitness_string == 'utilization':
+            metric_value = df_row['Avg number of utilized PEs'] / self.num_PEs
+            normalized_metric_value = metric_value
+        elif fitness_string == 'latency':
+            metric_value = df_row[' Runtime (Cycles)']
+        elif fitness_string == 'energy':
+            metric_value = df_row[' Activity count-based Energy (nJ)']
+        elif fitness_string == 'edp':
+            energy = df_row[' Activity count-based Energy (nJ)']
+            runtime = df_row[' Runtime (Cycles)']
+            edp = energy * runtime
+            max_edp = 2e11 # for edge hw config
+            metric_value = edp
+            normalized_metric_value = np.log(edp + 1) / np.log(max_edp + 1)
+        elif fitness_string == 'power':
+            metric_value = df_row[' Power']
+        elif fitness_string == 'area':
+            metric_value = df_row[' Area']
+
+        if not normalized_metric_value:
+            normalized_metric_value = metric_value
+        return metric_value, normalized_metric_value
+
+    def evaluate_fitness_from_metrics(self, csv_file_path):
         try:
             df = pd.read_csv(csv_file_path)
-            df.columns = df.columns.str.strip()
-
-            best_fitness = -float('inf')
-            best_utilization = 0
-            best_edp = float('inf')
             
-            fitness_scores = []
-            performance_list = []
-
-            utilization_list = []
-            edp_list = []
+            pop_fitness_score_list = [] # [calculated fitness score * population_size]
+            pop_performance_list = [] # [(fitness1 value, fitness2 value) * population_size]
             
-            max_edp = 2e11
+            pop_fitness1_list = [] # [fitness1 value * population_size]
+            pop_fitness2_list = [] # [fitness2 value * population_size]
+            pop_normalized_fitness1_list = [] # [fitness1 norm value * population_size]
+            pop_normalized_fitness2_list = [] # [fitness2 norm value * population_size]
             
             for _, row in df.iterrows():
-                energy = row['Activity count-based Energy (nJ)']
-                runtime = row['Runtime (Cycles)']
-                avg_utilized_pes = row['Avg number of utilized PEs']
-
-                utilization = avg_utilized_pes / self.num_PEs
-                edp = energy * runtime
+                fitness1_value, normalized_fitness1_value = self.fetch_metric_by_name(row, fitness_string=self.fitness1)
+                fitness2_value, normalized_fitness2_value = self.fetch_metric_by_name(row, fitness_string=self.fitness2)
 
                 # Append raw performance values
-                utilization_list.append(utilization)
-                edp_list.append(edp)
-                performance_list.append((utilization, edp))
-
-            # Apply log-scaling to EDP and fixed scaling to utilization
-            edp_scaled_list = [np.log(e + 1) / np.log(max_edp + 1) for e in edp_list]
+                pop_fitness1_list.append(fitness1_value)
+                pop_fitness2_list.append(fitness2_value)
+                pop_performance_list.append((fitness1_value, fitness2_value))
+                
+                # Append normalized performance values for calculating fitness score below
+                pop_normalized_fitness1_list.append(normalized_fitness1_value)
+                pop_normalized_fitness2_list.append(normalized_fitness2_value)
 
             # Calculate fitness scores
-            for u, e in zip(utilization_list, edp_scaled_list):
+            for u, e in zip(pop_normalized_fitness1_list, pop_normalized_fitness2_list):
                 offset = 10
                 fitness_value = self.alpha * u - self.beta * e + offset
-                fitness_scores.append(fitness_value)
+                pop_fitness_score_list.append(fitness_value)
 
-            # 최고 성능 업데이트
-            best_idx = np.argmax(fitness_scores)
-            self.best_fitness_score_list.append(fitness_scores[best_idx])
-            self.best_utilization_list.append(utilization_list[best_idx])
-            self.best_edp_list.append(edp_list[best_idx])
+            best_idx = np.argmax(pop_fitness_score_list)
+            self.best_fitness_score_list.append(pop_fitness_score_list[best_idx])
+            self.best_perf_fitness1_list.append(pop_fitness1_list[best_idx])
+            self.best_perf_fitness2_list.append(pop_fitness2_list[best_idx])
 
-            return fitness_scores, performance_list
+            return pop_fitness_score_list, pop_performance_list
 
         except FileNotFoundError:
             print(f"CSV 파일 '{csv_file_path}'을 찾을 수 없습니다.")
@@ -184,8 +211,8 @@ class GAMAPPER:
             model_name=self.model_name
         )
         metric_csv = self.run_maestro_to_get_all_metrics(mapping_file_path)
-        fitness_scores, performance_list = self.get_fitness_scores(metric_csv)
-        return fitness_scores, performance_list
+        pop_fitness_score_list, pop_performance_list = self.evaluate_fitness_from_metrics(metric_csv)
+        return pop_fitness_score_list, pop_performance_list
 
     @staticmethod
     def get_factors(n):
@@ -312,9 +339,9 @@ class GAMAPPER:
 
         return mapper
     
-    def find_best_score(self, fitness_scores):
-        best_score = max(fitness_scores)
-        best_idx = fitness_scores.index(best_score)
+    def find_best_score(self, pop_fitness_score_list):
+        best_score = max(pop_fitness_score_list)
+        best_idx = pop_fitness_score_list.index(best_score)
         return best_score, best_idx
 
     def create_chromosome(self):
@@ -496,7 +523,7 @@ class GAMAPPER:
         for mapper in population:
             original_mapper = [gene[:] for gene in mapper]  # Save the original state
             
-            dynamic_mutation_prob = min(0.2 + (1 - self.best_utilization) * 0.5, 0.8)
+            dynamic_mutation_prob = min(0.2 + (1 - self.best_perf_fitness1) * 0.5, 0.8)
             if random.random() < dynamic_mutation_prob:
                 mutation_success = False
                 attempts = 0
@@ -537,7 +564,7 @@ class GAMAPPER:
         
         for mapper in population:
             original_mapper = [gene[:] for gene in mapper]  # Save the original state
-            dynamic_mutation_prob = min(0.2 + (1 - self.best_utilization) * 0.5, 0.8)
+            dynamic_mutation_prob = min(0.2 + (1 - self.best_perf_fitness1) * 0.5, 0.8)
             
             if random.random() < dynamic_mutation_prob:
                 mutation_success = False
@@ -558,28 +585,15 @@ class GAMAPPER:
 
         return population
     
-    def replace_least_fit_individuals(self, population, offspring, fitness_scores):
+    def replace_least_fit_individuals(self, population, offspring, pop_fitness_score_list):
         """
             Replace the least fit individuals in the population with the offspring
         """
-        sorted_indices = sorted(range(len(fitness_scores)), key=lambda x: fitness_scores[x])
+        sorted_indices = sorted(range(len(pop_fitness_score_list)), key=lambda x: pop_fitness_score_list[x])
         for i in range(len(offspring)):
             worst_idx = sorted_indices[i]
             population[worst_idx] = offspring[i]
         return population
-    
-    def adjust_weights(self, generation, utilization):
-        """ deprecated """
-        factor = generation / self.max_generations
-
-        if utilization < 0.1:
-            self.alpha = min(1.0, self.alpha + 0.2 * (1 - utilization))
-        elif utilization < 0.2:
-            self.alpha = min(1.0, self.alpha + 0.1 * (1 - utilization))
-        else:
-            self.alpha = max(0.5, 0.7 + 0.3 * (1 - factor))
-
-        self.beta = max(0.1, 1.0 - self.alpha)
     
     def restart_population(self, population, restart_prob=0.2):
         """
@@ -604,36 +618,32 @@ class GAMAPPER:
         no_improvement_generations = 0
         last_best_fitness = -float('inf')
         
-        fitness_scores, performance_list = self.evaluate_population(population)
-        best_fitness, best_idx = self.find_best_score(fitness_scores)
-        best_utilization, best_edp = performance_list[best_idx]
+        pop_fitness_score_list, pop_performance_list = self.evaluate_population(population)
+        best_fitness, best_idx = self.find_best_score(pop_fitness_score_list)
+        best_perf_fitness1, best_perf_fitness2 = pop_performance_list[best_idx]
         elite_individual = population[best_idx]
         
         for i in range(self.max_generations): # Number of generations
             print(f"Generation {i + 1}......")
             
-            # Step1: Evaluate population
-
-            
-            # Track stagnation and apply restart if needed
+            # Step0: Track stagnation and apply restart if needed
             if best_fitness <= last_best_fitness:
                 no_improvement_generations += 1
                 print(f"No improvement for {no_improvement_generations} generations.")
             else:
                 no_improvement_generations = 0
                 last_best_fitness = best_fitness
-            
             if no_improvement_generations >= 3:  # Stagnation threshold
                 population = self.restart_population(population, restart_prob=0.5)
                 no_improvement_generations = 0
             
-            # Step2: Select parents
+            # Step1: Select parents
             selected_parents = []
             for _ in range(len(population) // 2):
-                parents = self.select_parents(population, fitness_scores)
+                parents = self.select_parents(population, pop_fitness_score_list)
                 selected_parents.append(parents)
             
-            # Step3: Crossover
+            # Step2: Crossover
             offspring = []
             for parent1, parent2 in selected_parents:
                 # if random.random() < 0.5:
@@ -642,43 +652,39 @@ class GAMAPPER:
                 children = self.crossover_dim([parent1, parent2], crossover_prob=0.7)
                 offspring.extend(children)
             
-            # Step4: Mutation
+            # Step3: Mutation
             self.mutate_tiles(offspring, mutation_prob=0.5)
             self.mutate_pods(offspring, mutation_prob=0.5)
             
-            # Step5: Replace least fit individual with new offspring
-            self.replace_least_fit_individuals(population, offspring, fitness_scores)
+            # Step4: Replace least fit individual with new offspring
+            self.replace_least_fit_individuals(population, offspring, pop_fitness_score_list)
             print("\telite_individual", elite_individual)
             population[0] = elite_individual
 
-            fitness_scores, performance_list = self.evaluate_population(population)
-            best_fitness, best_idx = self.find_best_score(fitness_scores)
-            best_utilization, best_edp = performance_list[best_idx]
+            pop_fitness_score_list, pop_performance_list = self.evaluate_population(population)
+            best_fitness, best_idx = self.find_best_score(pop_fitness_score_list)
+            best_perf_fitness1, best_perf_fitness2 = pop_performance_list[best_idx]
             elite_individual = population[best_idx]
 
             self.best_fitness = best_fitness
-            self.best_utilization = best_utilization
-            self.best_edp = best_edp
+            self.best_perf_fitness1 = best_perf_fitness1
+            self.best_perf_fitness2 = best_perf_fitness2
             print('\t', len(population), 'individuals in the population')
             print('\t', len(offspring), 'individuals in the offspring')
-            print(f'\tBest fitness score: {best_fitness}, Best utilization: {best_utilization}', f'Best EDP: {best_edp}')
+            print(f'\tBest fitness score: {best_fitness}, Best Fitness1: {best_perf_fitness1}', f'Best Fitness2: {best_perf_fitness2}')
 
         self.save_to_csv({
             'Best Fitness Score': self.best_fitness_score_list,
-            'Best Utilization': self.best_utilization_list,
-            'Best EDP': self.best_edp_list
+            f'Best {self.fitness1}': self.best_perf_fitness1_list,
+            f'Best {self.fitness2}': self.best_perf_fitness2_list
         }, self.model_name)
 
-        return population, best_fitness, best_idx
+        return population[best_idx]
 
 if __name__ == "__main__":
-    model_name = 'single_layer_conv' # {'single_layer_conv', 'single_layer_gemm', 'single_layer_fc', 'multi_layer'}
-    hardware_config = 'accelerator_edge'
-    
-    conv_layer = extract_dimensions(f'data/model/{model_name}.m') 
-    # CONV - {'K': 256, 'C': 128, 'R': 3, 'S': 3, 'Y': 14, 'X': 14}
-    # GEMM - {'K': 512, 'C': 512, 'R': 1, 'S': 1, 'Y': 256, 'X': 1 }
-    # FC - {'K': 256, 'C': 1024, 'R': 1, 'S': 1, 'Y': 1, 'X': 1}
+    model_name = 'single_layer_conv' # {'single_layer_conv', 'single_layer_gemm', 'single_layer_fc', 'multi_layers'}
+    hardware_config = 'accelerator_edge' # {'accelerator_edge'}
+    dnn_layer_dict = extract_dimensions(f'data/model/{model_name}.m')
     
     model = GAMAPPER(
         hw_config_file=hardware_config,
@@ -688,14 +694,12 @@ if __name__ == "__main__":
         max_generations=5,
         alpha=0.7, beta=0.3
     )
-    population, best_score, best_idx = model.run_ga(dimensions=conv_layer)
-    print("Best mapper: ", population[best_idx])
-    
-    # Run the last best individual
-    best_mapper = population[best_idx]
-    # best_mapper = [[['P', 113], ['C', 1], ['K', 154], ['X', 1], ['R', 3], ['Y', 9], ['S', 3], ['P', 5], ['X', 1], ['R', 3], ['S', 3], ['Y', 4], ['K', 1], ['C', 1]]]
-    final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=conv_layer, model_name=f'final_result_{model_name}')
+    best_mapper = model.run_ga(dimensions=dnn_layer_dict[0])
 
+    # Run the best individual
+    # best_mapper = population[best_idx]
+    final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{model_name}')
     final_result_csv = model.run_maestro_to_get_all_metrics(final_mapping_file_path)
-    print(f'Final result saved in {final_result_csv}')
     
+    print("Best mapper: ", best_mapper)
+    print(f'Final mapping file saved in {final_mapping_file_path}') # data/mapping/final_result_single_layer_conv.m
