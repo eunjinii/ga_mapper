@@ -31,6 +31,7 @@ class GAMAPPER:
             for line in f:
                 if 'num_pes' in line:
                     self.num_PEs = int(line.split(":")[1])
+                    print(f"Number of PEs: {self.num_PEs}")
 
         self.result_dir = 'out'
         self.dimensions = {}
@@ -124,27 +125,27 @@ class GAMAPPER:
             utilization_list = []
             edp_list = []
             
+            max_edp = 2e11
+            
             for _, row in df.iterrows():
                 energy = row['Activity count-based Energy (nJ)']
                 runtime = row['Runtime (Cycles)']
                 avg_utilized_pes = row['Avg number of utilized PEs']
 
-                utilization = avg_utilized_pes / self.num_PEs * 100
+                utilization = avg_utilized_pes / self.num_PEs
                 edp = energy * runtime
-                
+
+                # Append raw performance values
                 utilization_list.append(utilization)
                 edp_list.append(edp)
                 performance_list.append((utilization, edp))
 
-            # Z-score normalization
-            scaler = StandardScaler()
-            scaled_data = scaler.fit_transform(np.array([utilization_list, edp_list]).T)
-            utilization_scaled = scaled_data[:, 0]
-            edp_scaled = scaled_data[:, 1]
+            # Apply log-scaling to EDP and fixed scaling to utilization
+            edp_scaled_list = [np.log(e + 1) / np.log(max_edp + 1) for e in edp_list]
 
             # Calculate fitness scores
-            for u, e in zip(utilization_scaled, edp_scaled):
-                offset = 10  # 양수 오프셋
+            for u, e in zip(utilization_list, edp_scaled_list):
+                offset = 10
                 fitness_value = self.alpha * u - self.beta * e + offset
                 fitness_scores.append(fitness_value)
 
@@ -418,6 +419,7 @@ class GAMAPPER:
     def crossover_tile(self, parents, crossover_prob=0.7):
         parent1, parent2 = parents
         offspring = []
+        crossover_success = False
         
         if random.random() < crossover_prob:
             idx1, idx2 = sorted(random.sample(range(1, 7), 2))
@@ -426,18 +428,20 @@ class GAMAPPER:
             child1 = [gene[:] for gene in parent1]
             child2 = [gene[:] for gene in parent2]
 
+            # Perform L2 crossover and check constraints
             child1[idx1][1], child2[idx2][1] = parent2[idx1][1], parent1[idx2][1]
-            child1[idx3][1], child2[idx4][1] = parent2[idx3][1], parent1[idx4][1]
+            if not (self.check_constraints(child1[:7], level='l2') and self.check_constraints(child2[:7], level='l2')):
+                child1[idx1][1], child2[idx2][1] = parent1[idx1][1], parent2[idx2][1]
             
-            if (self.check_constraints(child1[:7], level='l2') and
-                self.check_constraints(child1[7:], level='l1') and
-                self.check_constraints(child2[:7], level='l2') and
-                self.check_constraints(child2[7:], level='l1')):
-                offspring.extend([child1, child2])
-            else:
-                offspring.extend([parent1, parent2])
+            # Perform L1 crossover and check constraints
+            child1[idx3][1], child2[idx4][1] = parent2[idx3][1], parent1[idx4][1]
+            if not (self.check_constraints(child1[7:], level='l1') and self.check_constraints(child2[7:], level='l1')):
+                child1[idx3][1], child2[idx4][1] = parent1[idx3][1], parent2[idx4][1]
+            
+            offspring.extend([child1, child2])
         else:
             offspring.extend([parent1, parent2])
+
         return offspring
     
     def crossover_dim(self, parents, crossover_prob=0.7):
@@ -472,25 +476,7 @@ class GAMAPPER:
                 offspring.append(child2)
             else:
                 offspring.append(parent2)
-            
-            # # L2에서 교차할 인덱스 쌍 하나 선택
-            # if l2_dim_pairs:
-            #     idx1, idx2 = random.choice(l2_dim_pairs)
-            #     child1[idx1], child2[idx2] = parent2[idx1], parent1[idx2]
 
-            # # L1에서 교차할 인덱스 쌍 하나 선택
-            # if l1_dim_pairs:
-            #     idx3, idx4 = random.choice(l1_dim_pairs)
-            #     child1[idx3], child2[idx4] = parent2[idx3], parent1[idx4]
-
-            # # 제약 조건 검증
-            # if (self.check_constraints(child1[:7], level='l2') and
-            #     self.check_constraints(child1[7:], level='l1') and
-            #     self.check_constraints(child2[:7], level='l2') and
-            #     self.check_constraints(child2[7:], level='l1')):
-            #     offspring.extend([child1, child2])
-            # else:
-            #     offspring.extend([parent1, parent2])
         else:
             offspring.extend([parent1, parent2])
         return offspring
@@ -562,7 +548,6 @@ class GAMAPPER:
 
                     if not mutation_success:
                         mapper[idx1][1] = original_mapper[idx1][1]
-                        print("Pod mutation failed constraints; reverting to previous gene values.")
 
         return population
     
@@ -580,17 +565,25 @@ class GAMAPPER:
         """ deprecated """
         factor = generation / self.max_generations
 
-        # Adaptive Alpha/Beta 조정
         if utilization < 0.1:
             self.alpha = min(1.0, self.alpha + 0.2 * (1 - utilization))
         elif utilization < 0.2:
             self.alpha = min(1.0, self.alpha + 0.1 * (1 - utilization))
         else:
-            # 세대 수가 진행되면 alpha 감소
             self.alpha = max(0.5, 0.7 + 0.3 * (1 - factor))
 
         self.beta = max(0.1, 1.0 - self.alpha)
-        # print(f"Adjusted weights: alpha={self.alpha}, beta={self.beta}")
+    
+    def restart_population(self, population, restart_prob=0.2):
+        """
+        Reinitialize a portion of the population if restart_prob is met.
+        """
+        if random.random() < restart_prob:
+            num_to_restart = int(len(population) * 0.3)  # Restart 30% of the population
+            new_individuals = [self.create_chromosome() for _ in range(num_to_restart)]
+            population[-num_to_restart:] = new_individuals
+            print(f"Restarted {num_to_restart} individuals due to stagnation.")
+        return population
     
     def run_ga(self, dimensions):
         self.dimensions = dimensions
@@ -600,15 +593,30 @@ class GAMAPPER:
         result_csv = "combined_model_mapping.csv"
         if os.path.exists(result_csv):
             os.remove(result_csv)
+
+        no_improvement_generations = 0
+        last_best_fitness = -float('inf')
         
         for i in range(self.max_generations): # Number of generations
             print(f"Generation {i + 1}......")
+            
             # Step1: Evaluate population
             fitness_scores, performance_list = self.evaluate_population(population)
             best_fitness, best_idx = self.find_best_score(fitness_scores)
             best_utilization, best_edp = performance_list[best_idx]
-            
             elite_individual = population[best_idx]
+            
+            # Track stagnation and apply restart if needed
+            if best_fitness <= last_best_fitness:
+                no_improvement_generations += 1
+                print(f"No improvement for {no_improvement_generations} generations.")
+            else:
+                no_improvement_generations = 0
+                last_best_fitness = best_fitness
+            
+            if no_improvement_generations >= 3:  # Stagnation threshold
+                population = self.restart_population(population, restart_prob=0.5)
+                no_improvement_generations = 0
             
             # Step2: Select parents
             selected_parents = []
@@ -620,19 +628,19 @@ class GAMAPPER:
             offspring = []
             for parent1, parent2 in selected_parents:
                 # if random.random() < 0.5:
-                children = self.crossover_tile([parent1, parent2], crossover_prob=0.7)
+                children = self.crossover_tile([parent1, parent2], crossover_prob=0.8)
                 # else:
                 children = self.crossover_dim([parent1, parent2], crossover_prob=0.7)
                 offspring.extend(children)
-                
+            
             # Step4: Mutation
             self.mutate_tiles(offspring, mutation_prob=0.5)
             self.mutate_pods(offspring, mutation_prob=0.5)
-            print("\telite_individual", elite_individual)
-            population[0] = elite_individual
             
             # Step5: Replace least fit individual with new offspring
             self.replace_least_fit_individuals(population, offspring, fitness_scores)
+            print("\telite_individual", elite_individual)
+            population[0] = elite_individual
 
             self.best_fitness = best_fitness
             self.best_utilization = best_utilization
@@ -661,9 +669,9 @@ if __name__ == "__main__":
         hw_config_file=hardware_config,
         model_name=model_name,
         fitness=['utilization', 'edp'],
-        popluation_size=100,
+        popluation_size=150,
         max_generations=50,
-        alpha=0.6, beta=0.4
+        alpha=0.7, beta=0.3
     )
     population, best_score, best_idx = model.run_ga(dimensions=conv_layer)
     print(population[best_idx])
