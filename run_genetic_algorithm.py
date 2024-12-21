@@ -41,15 +41,16 @@ class GAMAPPER:
         self.best_perf_fitness3 = float('inf') # memory access
         self.best_perf_fitness4 = 0 # reuse factor
         
-        self.max_latency = 0
-        self.max_memory_access = 0
-        self.max_reuse_factor = 0
+        self.max_latency = None
+        self.max_memory_access = None
+        self.max_reuse_factor = None
         
         self.best_fitness_score_list = [] # [fitness score] * generation size
         self.best_perf_fitness1_list = [] # [metric1 value] * generation size
         self.best_perf_fitness2_list = []
         self.best_perf_fitness3_list = []
         self.best_perf_fitness4_list = []
+        self.best_mapper_list = []
 
     def run_maestro_to_get_all_metrics(self, mapping_file_path):
         try:
@@ -102,48 +103,7 @@ class GAMAPPER:
         parents = random.choices(population, weights=normalized_pop_fitness_score_list, k=2)
         return parents
 
-    def fetch_metric_by_name(self, df_row, fitness_string='utilization'):
-        """
-        deprecated
-        Fetches the metric value from the DataFrame row based on the metric name.
-        Normalized metric_value range is [0, 1]
-        """
-        metric_value = None
-        normalized_metric_value = None
-        
-        if fitness_string == 'utilization':
-            metric_value = df_row['Avg number of utilized PEs'] / self.num_PEs
-            normalized_metric_value = metric_value
-        elif fitness_string == 'latency':
-            latency = df_row[' Runtime (Cycles)'] / 1000
-            metric_value = latency
-            max_lat = 2e4 # for edge hw config
-            # normalized_metric_value = np.log(latency + 1)
-            normalized_metric_value = np.log(latency + 1) / np.log(max_lat + 1)
-        elif fitness_string == 'energy':
-            energy = df_row[' Activity count-based Energy (nJ)']
-            metric_value = energy
-        elif fitness_string == 'edp':
-            energy = df_row[' Activity count-based Energy (nJ)']
-            runtime = df_row[' Runtime (Cycles)']
-            edp = energy * runtime
-            max_edp = 2e9 # for edge hw config
-            metric_value = edp
-            normalized_metric_value = np.log(edp / 1000 + 1) / np.log(max_edp + 1)
-            # normalized_metric_value = np.log(edp + 1)
-        elif fitness_string == 'power':
-            power = df_row[' Power']
-            metric_value = power
-            if power > 450:  # 전력 제약 위반 확인
-                return -float('inf'), -float('inf')  # 페널티 적용
-        elif fitness_string == 'area':
-            metric_value = df_row[' Area']
-
-        if normalized_metric_value is None:
-            normalized_metric_value = metric_value
-        return metric_value, normalized_metric_value
-
-    def evaluate_fitness_from_metrics(self, csv_file_path):
+    def evaluate_fitness_from_metrics(self, csv_file_path, population):
         try:            
             df = pd.read_csv(csv_file_path)
             
@@ -160,22 +120,32 @@ class GAMAPPER:
             pop_normalized_fitness4_list = [] # [fitness4 norm value * population_size]
             
             for _, row in df.iterrows():
-                # fitness1_value, normalized_fitness1_value = self.fetch_metric_by_name(row, fitness_string=self.fitness1)
-                # fitness2_value, normalized_fitness2_value = self.fetch_metric_by_name(row, fitness_string=self.fitness2)
-                
-                latency = row[' Runtime (Cycles)'] # 0~200000
-                utilization = row['Avg number of utilized PEs'] / self.num_PEs # 0 ~ 1
-                memory_access = row[' L1 SRAM Size Req (Bytes)'] + row['  L2 SRAM Size Req (Bytes)'] + row[' Offchip BW Req (Elements/cycle)'] # 0 ~ 300000
+                latency = row[' Runtime (Cycles)']
+                utilization = row['Avg number of utilized PEs'] / self.num_PEs
+                l1_access = row[' input l1 read'] + row[' input l1 write'] + row['filter l1 read'] + row[' filter l1 write'] + row['output l1 read'] + row[' output l1 write']
+                l2_access = row[' input l2 read'] + row[' input l2 write'] + row[' filter l2 read'] + row[' filter l2 write'] + row[' output l2 read'] + row[' output l2 write']
+                dram_access = row[' Offchip BW Req (Elements/cycle)'] * row[' Runtime (Cycles)']
+                memory_access = l1_access + 2*l2_access + 6*dram_access
                 reuse_factor = (row[' input reuse factor'] + row[' filter reuse factor'] + row[' output reuse factor']) / 3 # 0~1000
                 
                 # Normalize the values
-                self.max_latency = max(self.max_latency, latency)
-                self.max_memory_access = max(self.max_memory_access, memory_access)
-                self.max_reuse_factor = max(self.max_reuse_factor, reuse_factor)
+                if self.max_latency is None:
+                    self.max_latency = latency
+                else: # Update the max latency
+                    self.max_latency = max(self.max_latency, latency)
+                if self.max_memory_access is None:
+                    self.max_memory_access = memory_access
+                else:
+                    self.max_memory_access = max(self.max_memory_access, memory_access)
+                if self.max_reuse_factor is None:
+                    self.max_reuse_factor = reuse_factor
+                else:
+                    self.max_reuse_factor = max(self.max_reuse_factor, reuse_factor)
 
                 norm_latency = np.log(latency + 1) / np.log(self.max_latency + 1)
                 norm_utilization = utilization
-                norm_memory_access = np.log(memory_access + 1) / np.log(self.max_memory_access + 1)
+                # norm_memory_access = np.log(memory_access + 1) / np.log(self.max_memory_access + 1)
+                norm_memory_access = (memory_access - 1) / (self.max_memory_access + 1)
                 norm_reuse_factor = reuse_factor / self.max_reuse_factor
                 
                 # Append raw performance values
@@ -191,10 +161,10 @@ class GAMAPPER:
                 pop_normalized_fitness3_list.append(norm_memory_access)
                 pop_normalized_fitness4_list.append(norm_reuse_factor)
 
-                # offset = 5
+                offset = 5
                 lambda_val = 0.7
-                power_proxy = 0.2 * norm_utilization - 0.5 * norm_memory_access + 0.3 * norm_reuse_factor
-                fitness_score = lambda_val * (1 - norm_latency) + (1 - lambda_val) * power_proxy 
+                power_proxy = 0.3 * norm_utilization - 0.3 * norm_memory_access + 0.4 * norm_reuse_factor
+                fitness_score = lambda_val * (1 - norm_latency) + (1 - lambda_val) * power_proxy + 5
                 pop_fitness_score_list.append(fitness_score)
 
             best_idx = np.argmax(pop_fitness_score_list)
@@ -203,6 +173,7 @@ class GAMAPPER:
             self.best_perf_fitness2_list.append(pop_fitness2_list[best_idx])
             self.best_perf_fitness3_list.append(pop_fitness3_list[best_idx])
             self.best_perf_fitness4_list.append(pop_fitness4_list[best_idx])
+            self.best_mapper_list.append(population[best_idx])
             
             # print("\tpop_normalized_fitness1_list:", pop_normalized_fitness1_list)
             # print("\tpop_normalized_fitness2_list:", pop_normalized_fitness2_list)
@@ -226,7 +197,7 @@ class GAMAPPER:
             model_name=self.model_name
         )
         metric_csv = self.run_maestro_to_get_all_metrics(mapping_file_path)
-        pop_fitness_score_list, pop_performance_list = self.evaluate_fitness_from_metrics(metric_csv)
+        pop_fitness_score_list, pop_performance_list = self.evaluate_fitness_from_metrics(metric_csv, population)
         return pop_fitness_score_list, pop_performance_list
 
     @staticmethod
@@ -447,10 +418,10 @@ class GAMAPPER:
     
     def save_to_csv(self, lists_dict, layer_name):
         """
-            Sample input: {'Best Fitness Score': [1, 2, 3], 'Best Utilization': [0.1, 0.2, 0.3]}
+            Sample lists_dict: {'Best Fitness Score': [1, 2, 3], 'Best Utilization': [0.1, 0.2, 0.3], 'Best Mapping': [[], [], []]}
         """
         # Get current date and time
-        current_time = datetime.now().strftime("%Y.%m.%d_%H:%M")
+        current_time = datetime.now().strftime("%Y_%m_%d_%H:%M")
         filename = f'fitness_{layer_name}_{current_time}.csv'
         
         # Find the maximum length of lists
@@ -727,15 +698,15 @@ class GAMAPPER:
             self.best_perf_fitness4 = best_perf_fitness4
             # print('\t', len(population), 'individuals in the population')
             # print('\t', len(offspring), 'individuals in the offspring')
-            print(f'\tBest fitness score: {best_fitness:.4f}, Best Latency: {best_perf_fitness1:.4f}, \
-                Best Utilization: {best_perf_fitness2:.4f}, Best Memory Access: {best_perf_fitness3:.4f}, Best Reuse Factor: {best_perf_fitness4:.4f}')
-
+            print(f'\tBest fitness score: {best_fitness:.4f}, Best Latency: {best_perf_fitness1:.4f}, Best Utilization: {best_perf_fitness2:.4f}, Best Memory Access: {best_perf_fitness3:.4f}, Best Reuse Factor: {best_perf_fitness4:.4f}, \n \tBest Mapper: {population[best_idx]}')
+                  
         self.save_to_csv({
             'Best Fitness Score': self.best_fitness_score_list,
             f'Best Latency': self.best_perf_fitness1_list,
             f'Best Utilization': self.best_perf_fitness2_list,
             f'Best Memory Access': self.best_perf_fitness3_list,
-            f'Best Reuse Factor': self.best_perf_fitness4_list
+            f'Best Reuse Factor': self.best_perf_fitness4_list,
+            f'Best Mapper': self.best_mapper_list,
         }, self.model_name)
 
         print("\tBest mapper: ", population[best_idx])
@@ -748,6 +719,7 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, default='single_conv', choices=('single_conv', 'single_gemm', 'single_fc'), help='Model defined in data/model in MAESTO format')
     parser.add_argument('--hwconfig', type=str, default='mobile', choices=('mobile', 'cloud'), help='Hardware config defined in data/hw in MAESTRO format')
     args = parser.parse_args()
+    current_time = datetime.now().strftime("%Y_%m_%d")
     
     # Run the Genetic Algorithm
     model = GAMAPPER(
@@ -762,9 +734,9 @@ if __name__ == "__main__":
     # best_mapper = [['P', 121], ['S', 3], ['Y', 7], ['X', 7], ['R', 3], ['C', 128], ['K', 85], ['P', 68], ['C', 1], ['K', 1], ['X', 6], ['Y', 6], ['R', 3], ['S', 3]]
 
     # Run the best individual
-    final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{args.model}')
+    final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{args.model}_{current_time}')
     # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_gamma')
     final_result_csv = model.run_maestro_to_get_all_metrics(final_mapping_file_path)
 
-    print("Best mapper: ", best_mapper)
+    print("Optimal mapper: ", best_mapper)
     print(f'Final mapping file saved in {final_mapping_file_path}') # data/mapping/final_result_single_conv.m
