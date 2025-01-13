@@ -13,17 +13,12 @@ from multiprocessing import Pool, cpu_count
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
     
-class GAMAPPER:
-    def __init__(self, hw_config='', model_name='', popluation_size=100, max_generations=10, alpha=0.7, beta=0.3):
-        super(GAMAPPER,self).__init__()
+class MAGNETO:
+    def __init__(self, hw_config='', model_name='', popluation_size=100, max_generations=10):
+        super(MAGNETO,self).__init__()
         self.hw_config = hw_config
         self.hw_mapping_file = f'{model_name}_mapping'
         self.model_name = model_name
-        # self.fitness1 = fitness[0]
-        # self.fitness2 = fitness[1]
-        # self.alpha = alpha
-        # self.beta = beta
-
         self.num_PEs = 0
         with open(f'data/hw/{self.hw_config}.m') as f:
             for line in f:
@@ -716,26 +711,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--generation', type=int, default=10, help='Number of generations')
     parser.add_argument('--population', type=int, default=10, help='Number of populations')
-    parser.add_argument('--model', type=str, default='single_conv', choices=('single_conv', 'single_gemm', 'single_fc'), help='Model defined in data/model in MAESTO format')
+    parser.add_argument('--model', type=str, default='single_conv', help='Model defined in data/model in MAESTO format')
     parser.add_argument('--hwconfig', type=str, default='mobile', choices=('mobile', 'cloud'), help='Hardware config defined in data/hw in MAESTRO format')
     args = parser.parse_args()
     current_time = datetime.now().strftime("%Y_%m_%d")
     
     # Run the Genetic Algorithm
-    model = GAMAPPER(
+    model = MAGNETO(
         hw_config=args.hwconfig,
         model_name=args.model,
         popluation_size=args.population,
         max_generations=args.generation,
-        alpha=0.6, beta=0.4
     )
     dnn_layer_dict = model.extract_dimensions(f'data/model/{args.model}.m')
     best_mapper = model.run_ga(dimensions=dnn_layer_dict[0])
-    # best_mapper = [['P', 121], ['S', 3], ['Y', 7], ['X', 7], ['R', 3], ['C', 128], ['K', 85], ['P', 68], ['C', 1], ['K', 1], ['X', 6], ['Y', 6], ['R', 3], ['S', 3]]
+    # best_mapper = [['P', 40], ['C', 3], ['R', 3], ['X', 62], ['Y', 1], ['K', 1], ['S', 3], ['P', 3], ['R', 3], ['Y', 1], ['S', 3], ['X', 1], ['K', 1], ['C', 1]] # vgg16_conv1
+    # best_mapper = [['P', 144], ['S', 1], ['R', 1], ['K', 164], ['X', 1], ['Y', 1], ['C', 280], ['P', 147], ['S', 1], ['K', 54], ['Y', 1], ['R', 1], ['C', 1], ['X', 1]]# transformer_fc
+    # best_mapper = [['P', 133], ['X', 1], ['K', 45], ['S', 1], ['R', 1], ['Y', 25], ['C', 67], ['P', 42], ['X', 1], ['S', 1], ['K', 1], ['R', 1], ['Y', 1], ['C', 65]] # transformer_qk
 
     # Run the best individual
     final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{args.model}_{current_time}')
-    # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_gamma')
+    # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'gamma_{args.model}_{current_time}')
     final_result_csv = model.run_maestro_to_get_all_metrics(final_mapping_file_path)
 
     print("Optimal mapper: ", best_mapper)
