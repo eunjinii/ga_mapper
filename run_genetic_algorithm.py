@@ -17,7 +17,6 @@ class MAGNETO:
     def __init__(self, hw_config='', model_name='', popluation_size=100, max_generations=10):
         super(MAGNETO,self).__init__()
         self.hw_config = hw_config
-        self.hw_mapping_file = f'{model_name}_mapping'
         self.model_name = model_name
         self.num_PEs = 0
         with open(f'data/hw/{self.hw_config}.m') as f:
@@ -362,6 +361,51 @@ class MAGNETO:
         l2_mapper = self.encode_mapper(self.dimensions, level='l2')
         l1_mapper = self.encode_mapper(self.dimensions, level='l1')
         return l2_mapper + l1_mapper
+    
+    def create_dataflow_template_string(self, dimensions, mapper):
+        dataflow_template = ''
+        dataflow_template += "\t\tDataflow {\n"
+        
+        l2_mapper, l1_mapper = mapper[:7], mapper[7:]
+        
+        for i, mapping in enumerate([l2_mapper, l1_mapper]):
+            if i == 0: # L2
+                for j, (dim, tile_size) in enumerate(mapping[1:]):
+                    if j == 0:
+                        if dim == 'R':
+                            dataflow_template += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
+                        elif dim == 'S':
+                            dataflow_template += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
+                        else:    
+                            dataflow_template += f"\t\t\tSpatialMap({tile_size},{tile_size}) {dim};\n"
+                    else:
+                        if dim == 'R':
+                            dataflow_template += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
+                        elif dim == 'S':
+                            dataflow_template += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
+                        else:   
+                            dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
+            else: # L1 
+                for j, (dim, tile_size) in enumerate(mapping):
+                    if j == 0:
+                        dataflow_template += f"\t\t\tCluster({tile_size}, {dim});\n"
+                    elif j == 1:
+                        if dim == 'R':
+                            dataflow_template += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
+                        elif dim == 'S':
+                            dataflow_template += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
+                        else:    
+                            dataflow_template += f"\t\t\tSpatialMap({tile_size}, {tile_size}) {dim};\n"
+                    else:
+                        if dim == 'R':
+                            dataflow_template += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
+                        elif dim == 'S':
+                            dataflow_template += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
+                        else:    
+                            dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
+        dataflow_template += "\t\t}\n"
+        return dataflow_template
+        
 
     def create_mapping_file(self, population, dimensions, model_name):
         """
@@ -377,31 +421,11 @@ class MAGNETO:
         dataflow_template = ''
         
         for idx, mapper in enumerate(population):
-            dataflow_template += f"\tLayer CONV{idx} {{\n"
+            dataflow_template += f"\tLayer Layer{idx} {{\n"
             dataflow_template += f"\t\tType: CONV\n"
             dimensions_str = ', '.join([f"{k}:{v}" for k, v in dimensions.items()])
             dataflow_template += f"\t\tDimensions {{ {dimensions_str} }}\n"
-            dataflow_template += "\t\tDataflow {\n"
-            
-            l2_mapper, l1_mapper = mapper[:7], mapper[7:]
-            
-            for i, mapping in enumerate([l2_mapper, l1_mapper]):
-                if i == 0: # L2
-                    for j, (dim, tile_size) in enumerate(mapping[1:]):
-                        if j == 0:
-                            dataflow_template += f"\t\t\tSpatialMap({tile_size},{tile_size}) {dim};\n"
-                        else:
-                            dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
-                else: # L1 
-                    for j, (dim, tile_size) in enumerate(mapping):
-                        if j == 0:
-                            dataflow_template += f"\t\t\tCluster({tile_size}, {dim});\n"
-                        elif j == 1:
-                            dataflow_template += f"\t\t\tSpatialMap({tile_size}, {tile_size}) {dim};\n"
-                        else:
-                            dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
-                    
-            dataflow_template += "\t\t}\n"
+            dataflow_template += self.create_dataflow_template_string(dimensions, mapper)
             dataflow_template += "\t}\n"
         
         mapping_template += f"{dataflow_template}}}\n"
@@ -435,6 +459,28 @@ class MAGNETO:
                 writer.writerow(row)
         
         print(f"Data saved to {filename}")
+    
+    def integrate_dataflow_in_model(self, dimensions, model_name, mapper):
+        output_model_path = f"data/mapping/magneto_{model_name}.m"
+
+        dataflow_template = self.create_dataflow_template_string(dimensions, mapper)
+
+        # Read and process the model file
+        with open(f'data/model/{model_name}.m', "r") as infile:
+            model_lines = infile.readlines()
+
+        output_lines = []
+        for line in model_lines:
+            output_lines.append(line)
+            if "Dimensions {" in line:
+                # Add Dataflow string after the Dimensions block
+                output_lines.append(dataflow_template)
+
+        # Write the model with mapper to the output file
+        with open(output_model_path, "w") as outfile:
+            outfile.writelines(output_lines)
+
+        print(f"Updated model saved to {output_model_path}")
     
     def initialize_population(self):
         population = []
@@ -622,29 +668,29 @@ class MAGNETO:
             population[-num_to_restart:] = new_individuals
             print(f"Restarted {num_to_restart} individuals due to stagnation.")
         return population
-    
+
     def run_ga(self, dimensions): 
         self.dimensions = dimensions
         population = self.initialize_population()
         best_fitness, best_idx = -1, -1
-        
+
         result_csv = f"{self.model_name}_mapping.csv"
         if os.path.exists(result_csv):
             os.remove(result_csv)
 
         no_improvement_generations = 0
         last_best_fitness = -float('inf')
-        
+
         # Evaluate the initial population
         pop_fitness_score_list, pop_performance_list = self.evaluate_population(population)
         best_fitness, best_idx = self.find_best_score(pop_fitness_score_list)
         best_perf_fitness1, best_perf_fitness2, best_perf_fitness3, best_perf_fitness4 = pop_performance_list[best_idx]
-        
+
         for i in range(self.max_generations):
             print(f"Generation {i + 1}......")
-            
+
             elite_individual = population[best_idx]
-            
+
             # Step0: Track stagnation and apply restart if needed
             if best_fitness <= last_best_fitness:
                 no_improvement_generations += 1
@@ -681,7 +727,6 @@ class MAGNETO:
             population[0] = elite_individual
 
             # Evaluate the new populations
-            # elite_individual = population[best_idx]
             pop_fitness_score_list, pop_performance_list = self.evaluate_population(population)
             best_fitness, best_idx = self.find_best_score(pop_fitness_score_list)
             best_perf_fitness1, best_perf_fitness2, best_perf_fitness3, best_perf_fitness4 = pop_performance_list[best_idx]
@@ -694,7 +739,7 @@ class MAGNETO:
             # print('\t', len(population), 'individuals in the population')
             # print('\t', len(offspring), 'individuals in the offspring')
             print(f'\tBest fitness score: {best_fitness:.4f}, Best Latency: {best_perf_fitness1:.4f}, Best Utilization: {best_perf_fitness2:.4f}, Best Memory Access: {best_perf_fitness3:.4f}, Best Reuse Factor: {best_perf_fitness4:.4f}, \n \tBest Mapper: {population[best_idx]}')
-                  
+
         self.save_to_csv({
             'Best Fitness Score': self.best_fitness_score_list,
             f'Best Latency': self.best_perf_fitness1_list,
@@ -725,13 +770,12 @@ if __name__ == "__main__":
     )
     dnn_layer_dict = model.extract_dimensions(f'data/model/{args.model}.m')
     best_mapper = model.run_ga(dimensions=dnn_layer_dict[0])
-    # best_mapper = [['P', 40], ['C', 3], ['R', 3], ['X', 62], ['Y', 1], ['K', 1], ['S', 3], ['P', 3], ['R', 3], ['Y', 1], ['S', 3], ['X', 1], ['K', 1], ['C', 1]] # vgg16_conv1
-    # best_mapper = [['P', 144], ['S', 1], ['R', 1], ['K', 164], ['X', 1], ['Y', 1], ['C', 280], ['P', 147], ['S', 1], ['K', 54], ['Y', 1], ['R', 1], ['C', 1], ['X', 1]]# transformer_fc
-    # best_mapper = [['P', 133], ['X', 1], ['K', 45], ['S', 1], ['R', 1], ['Y', 25], ['C', 67], ['P', 42], ['X', 1], ['S', 1], ['K', 1], ['R', 1], ['Y', 1], ['C', 65]] # transformer_qk
-
+    
     # Run the best individual
-    final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{args.model}_{current_time}')
+    # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{args.model}_{current_time}')
     # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'gamma_{args.model}_{current_time}')
+    
+    final_mapping_file_path = model.integrate_dataflow_in_model(dnn_layer_dict[0], args.model, best_mapper)
     final_result_csv = model.run_maestro_to_get_all_metrics(final_mapping_file_path)
 
     print("Optimal mapper: ", best_mapper)
