@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from datetime import datetime
     
 class MAGNETO:
-    def __init__(self, hw_config='', model_name='', popluation_size=100, max_generations=10):
+    def __init__(self, hw_config='', model_name='', popluation_size=100, max_generations=10, power_constraint=1000):
         super(MAGNETO,self).__init__()
         self.hw_config = hw_config
         self.model_name = model_name
@@ -28,6 +28,7 @@ class MAGNETO:
         self.dimensions = {}
         self.popluation_size = popluation_size
         self.max_generations = max_generations
+        self.power_constraint = power_constraint
         
         self.best_fitness = -1
         self.best_perf_fitness1 = float('inf') # latency
@@ -36,8 +37,9 @@ class MAGNETO:
         self.best_perf_fitness4 = 0 # reuse factor
         
         self.max_latency = None
-        self.max_memory_access = None
-        self.max_reuse_factor = None
+        self.max_weighted_memory_access = None
+        self.max_averaged_reuse_factor = None
+        self.max_edp = None
         
         self.best_fitness_score_list = [] # [fitness score] * generation size
         self.best_perf_fitness1_list = [] # [metric1 value] * generation size
@@ -64,8 +66,7 @@ class MAGNETO:
                 stderr=subprocess.PIPE, 
                 text=True
             )
-
-            # print("MAESTRO Output:", result.stdout)
+            
             if result.stderr:
                 print("MAESTRO Errors:", result.stderr)
 
@@ -76,6 +77,8 @@ class MAGNETO:
             
             if os.path.exists(result_csv):
                 return result_csv
+            elif os.path.exists(f"{mapping_file_path.split('.')[0]}.csv"): # temporary file
+                return f"{mapping_file_path.split('.')[0]}.csv"
             else:
                 print("CSV file not generated.")
                 return None
@@ -92,18 +95,18 @@ class MAGNETO:
                 return [1.0 for _ in pop_fitness_score_list]
             normalized_pop_fitness_score_list = [(Ri - Rw) + (Rb - Rw)/3 for Ri in pop_fitness_score_list]
             return normalized_pop_fitness_score_list
-        
+
         normalized_pop_fitness_score_list = normalize_pop_fitness_score_list(pop_fitness_score_list)
         parents = random.choices(population, weights=normalized_pop_fitness_score_list, k=2)
         return parents
 
     def evaluate_fitness_from_metrics(self, csv_file_path, population):
-        try:            
+        try:
             df = pd.read_csv(csv_file_path)
             
             pop_fitness_score_list = [] # [calculated fitness score * population_size]
             pop_performance_list = [] # [(fitness1 value, fitness2 value) * population_size]
-            
+
             pop_fitness1_list = [] # [fitness1 value * population_size]
             pop_fitness2_list = [] # [fitness2 value * population_size]
             pop_fitness3_list = [] # [fitness3 value * population_size]
@@ -113,52 +116,70 @@ class MAGNETO:
             pop_normalized_fitness3_list = [] # [fitness3 norm value * population_size]
             pop_normalized_fitness4_list = [] # [fitness4 norm value * population_size]
             
-            for _, row in df.iterrows():
+            power_over_constraint_count = 0
+            for i, row in df.iterrows():
+                freq_MHz = 350 # FIXME: Hardcoded
                 latency = row[' Runtime (Cycles)']
+                energy_nJ = row[' Activity count-based Energy (nJ)']
+                edp = latency * energy_nJ / (freq_MHz * 1e6)
                 utilization = row['Avg number of utilized PEs'] / self.num_PEs
                 l1_access = row[' input l1 read'] + row[' input l1 write'] + row['filter l1 read'] + row[' filter l1 write'] + row['output l1 read'] + row[' output l1 write']
                 l2_access = row[' input l2 read'] + row[' input l2 write'] + row[' filter l2 read'] + row[' filter l2 write'] + row[' output l2 read'] + row[' output l2 write']
                 dram_access = row[' Offchip BW Req (Elements/cycle)'] * row[' Runtime (Cycles)']
-                memory_access = l1_access + 2*l2_access + 6*dram_access
-                reuse_factor = (row[' input reuse factor'] + row[' filter reuse factor'] + row[' output reuse factor']) / 3 # 0~1000
+                
+                weighted_memory_access = l1_access + 2*l2_access + 6*dram_access
+                averaged_reuse_factor = (row[' input reuse factor'] + row[' filter reuse factor'] + row[' output reuse factor']) / 3 # 0~1000
+                
+                power_proxy_value = self.get_power_proxy_value(population[i])
                 
                 # Normalize the values
                 if self.max_latency is None:
                     self.max_latency = latency
                 else: # Update the max latency
                     self.max_latency = max(self.max_latency, latency)
-                if self.max_memory_access is None:
-                    self.max_memory_access = memory_access
+                if self.max_weighted_memory_access is None:
+                    self.max_weighted_memory_access = weighted_memory_access
                 else:
-                    self.max_memory_access = max(self.max_memory_access, memory_access)
-                if self.max_reuse_factor is None:
-                    self.max_reuse_factor = reuse_factor
+                    self.max_weighted_memory_access = max(self.max_weighted_memory_access, weighted_memory_access)
+                if self.max_averaged_reuse_factor is None:
+                    self.max_averaged_reuse_factor = averaged_reuse_factor
                 else:
-                    self.max_reuse_factor = max(self.max_reuse_factor, reuse_factor)
+                    self.max_averaged_reuse_factor = max(self.max_averaged_reuse_factor, averaged_reuse_factor)
+                if self.max_edp is None:
+                    self.max_edp = edp
+                else:
+                    self.max_edp = max(self.max_edp, edp)
 
                 norm_latency = np.log(latency + 1) / np.log(self.max_latency + 1)
+                # norm_latency = latency / self.max_latency
                 norm_utilization = utilization
-                # norm_memory_access = np.log(memory_access + 1) / np.log(self.max_memory_access + 1)
-                norm_memory_access = (memory_access - 1) / (self.max_memory_access + 1)
-                norm_reuse_factor = reuse_factor / self.max_reuse_factor
+                # norm_weighted_memory_access = np.log(weighted_memory_access + 1) / np.log(self.max_weighted_memory_access + 1)
+                
+                norm_weighted_memory_access = (weighted_memory_access - 1) / (self.max_weighted_memory_access + 1)
+                norm_averaged_reuse_factor = averaged_reuse_factor / self.max_averaged_reuse_factor
+                norm_edp = edp / self.max_edp
                 
                 # Append raw performance values
                 pop_fitness1_list.append(latency)
-                pop_fitness2_list.append(utilization)
-                pop_fitness3_list.append(memory_access)
-                pop_fitness4_list.append(reuse_factor)
-                pop_performance_list.append((latency, utilization, memory_access, reuse_factor))
+                pop_fitness2_list.append(edp)
+                pop_fitness3_list.append(weighted_memory_access)
+                pop_fitness4_list.append(averaged_reuse_factor)
+                pop_performance_list.append((latency, edp, weighted_memory_access, averaged_reuse_factor))
                 
                 # Append normalized performance values for calculating fitness score below
                 pop_normalized_fitness1_list.append(norm_latency)
-                pop_normalized_fitness2_list.append(norm_utilization)
-                pop_normalized_fitness3_list.append(norm_memory_access)
-                pop_normalized_fitness4_list.append(norm_reuse_factor)
+                pop_normalized_fitness2_list.append(norm_edp)
+                pop_normalized_fitness3_list.append(norm_weighted_memory_access)
+                pop_normalized_fitness4_list.append(norm_averaged_reuse_factor)
 
                 offset = 5
-                lambda_val = 0.7
-                power_proxy = 0.3 * norm_utilization - 0.3 * norm_memory_access + 0.4 * norm_reuse_factor
-                fitness_score = lambda_val * (1 - norm_latency) + (1 - lambda_val) * power_proxy + 5
+                # lambda_val = 0.7
+                fitness_score = 0.3 * norm_averaged_reuse_factor - 0.5 * norm_edp - 0.2 * norm_weighted_memory_access
+                # fitness_score = lambda_val * (1 - norm_latency) + (1 - lambda_val) * energy_efficiency_metric + offset
+                if power_proxy_value > self.power_constraint:
+                    # print(f"Power constraint violated: {power_proxy_value}")
+                    power_over_constraint_count += 1
+                    fitness_score = -100
                 pop_fitness_score_list.append(fitness_score)
 
             best_idx = np.argmax(pop_fitness_score_list)
@@ -169,6 +190,7 @@ class MAGNETO:
             self.best_perf_fitness4_list.append(pop_fitness4_list[best_idx])
             self.best_mapper_list.append(population[best_idx])
             
+            print(f"power_over_constraint_count: {power_over_constraint_count} / {self.popluation_size}")
             # print("\tpop_normalized_fitness1_list:", pop_normalized_fitness1_list)
             # print("\tpop_normalized_fitness2_list:", pop_normalized_fitness2_list)
             return pop_fitness_score_list, pop_performance_list
@@ -350,7 +372,7 @@ class MAGNETO:
         mapper = [['P', sp_sz]] + df
 
         return mapper
-    
+
     def find_best_score(self, pop_fitness_score_list):
         best_score = max(pop_fitness_score_list)
         # best_score = min(pop_fitness_score_list)
@@ -361,13 +383,13 @@ class MAGNETO:
         l2_mapper = self.encode_mapper(self.dimensions, level='l2')
         l1_mapper = self.encode_mapper(self.dimensions, level='l1')
         return l2_mapper + l1_mapper
-    
+
     def create_dataflow_template_string(self, dimensions, mapper):
         dataflow_template = ''
         dataflow_template += "\t\tDataflow {\n"
-        
+
         l2_mapper, l1_mapper = mapper[:7], mapper[7:]
-        
+
         for i, mapping in enumerate([l2_mapper, l1_mapper]):
             if i == 0: # L2
                 for j, (dim, tile_size) in enumerate(mapping[1:]):
@@ -376,16 +398,16 @@ class MAGNETO:
                             dataflow_template += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
                         elif dim == 'S':
                             dataflow_template += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
-                        else:    
+                        else:
                             dataflow_template += f"\t\t\tSpatialMap({tile_size},{tile_size}) {dim};\n"
                     else:
                         if dim == 'R':
                             dataflow_template += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
                         elif dim == 'S':
                             dataflow_template += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
-                        else:   
+                        else:
                             dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
-            else: # L1 
+            else: # L1
                 for j, (dim, tile_size) in enumerate(mapping):
                     if j == 0:
                         dataflow_template += f"\t\t\tCluster({tile_size}, {dim});\n"
@@ -394,18 +416,17 @@ class MAGNETO:
                             dataflow_template += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
                         elif dim == 'S':
                             dataflow_template += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
-                        else:    
+                        else:
                             dataflow_template += f"\t\t\tSpatialMap({tile_size}, {tile_size}) {dim};\n"
                     else:
                         if dim == 'R':
                             dataflow_template += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
                         elif dim == 'S':
                             dataflow_template += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
-                        else:    
+                        else:
                             dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
         dataflow_template += "\t\t}\n"
         return dataflow_template
-        
 
     def create_mapping_file(self, population, dimensions, model_name):
         """
@@ -413,13 +434,13 @@ class MAGNETO:
             Parameters:
                 population: List of mappers
                 dimensions: Dictionary of DNN layer dimensions, [{'K': 256, 'C': 128, 'R': 3, 'S': 3, 'Y': 14, 'X': 14}, {...}, ...]
-                model_name: Name of the model that is 
+                model_name: Name of the model that is
         """
         mapping_file_path = f"data/mapping/{model_name}_mapping.m"
         
         mapping_template = f"Network {model_name} {{\n"
         dataflow_template = ''
-        
+
         for idx, mapper in enumerate(population):
             dataflow_template += f"\tLayer Layer{idx} {{\n"
             dataflow_template += f"\t\tType: CONV\n"
@@ -435,33 +456,11 @@ class MAGNETO:
         
         return mapping_file_path
     
-    def save_to_csv(self, lists_dict, layer_name):
-        """
-            Sample lists_dict: {'Best Fitness Score': [1, 2, 3], 'Best Utilization': [0.1, 0.2, 0.3], 'Best Mapping': [[], [], []]}
-        """
-        # Get current date and time
-        current_time = datetime.now().strftime("%Y_%m_%d_%H:%M")
-        filename = f'fitness_{layer_name}_{current_time}.csv'
-        
-        # Find the maximum length of lists
-        max_length = max(len(lst) for lst in lists_dict.values())
-
-        # Pad shorter lists with None
-        padded_lists = {key: lst + [None] * (max_length - len(lst)) for key, lst in lists_dict.items()}
-
-        # Save to CSV
-        with open(filename, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            # Write header
-            writer.writerow(padded_lists.keys())
-            # Write rows
-            for row in zip(*padded_lists.values()):
-                writer.writerow(row)
-        
-        print(f"Data saved to {filename}")
-    
-    def integrate_dataflow_in_model(self, dimensions, model_name, mapper):
-        output_model_path = f"data/mapping/magneto_{model_name}.m"
+    def integrate_dataflow_in_model(self, dimensions, model_name, mapper, is_temp=False):
+        if is_temp:
+            output_model_path = f"temp_magneto_{model_name}.m"
+        else:
+            output_model_path = f"data/mapping/magneto_{model_name}.m"
 
         dataflow_template = self.create_dataflow_template_string(dimensions, mapper)
 
@@ -480,7 +479,58 @@ class MAGNETO:
         with open(output_model_path, "w") as outfile:
             outfile.writelines(output_lines)
 
-        print(f"Updated model saved to {output_model_path}")
+        return output_model_path
+
+    def get_power_proxy_value(self, mapper): # mapping: [['K',14], ..]
+        temp_model_with_mapping_m = self.integrate_dataflow_in_model(self.dimensions, self.model_name, mapper, is_temp=True)
+        interim_result_csv = model.run_maestro_to_get_all_metrics(temp_model_with_mapping_m)
+
+        freq_MHz = 300
+        energy_nJ = 0
+        cycles = 0
+        dram_access_energy_nJ = 0
+        
+        df = pd.read_csv(interim_result_csv)
+        # column_sums = df.sum()
+        for i, row in df.iterrows():
+            energy_nJ += row[' Activity count-based Energy (nJ)']
+            cycles += row[' Runtime (Cycles)']
+            # 16 bits, 30 pJ per bit
+            dram_access_energy_nJ += (row[' Offchip BW Req (Elements/cycle)'] * row[' Runtime (Cycles)']) * 2*8*30 
+
+        power_proxy_value = (energy_nJ + dram_access_energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6
+        
+        if os.path.exists(temp_model_with_mapping_m):
+            os.remove(temp_model_with_mapping_m)
+        if os.path.exists(interim_result_csv):
+            os.remove(interim_result_csv)
+        
+        return power_proxy_value
+    
+    def save_to_csv(self, lists_dict, layer_name):
+        """
+            Sample lists_dict: {'Best Fitness Score': [1, 2, 3], 'Best Utilization': [0.1, 0.2, 0.3], 'Best Mapping': [[], [], []]}
+        """
+        # Get current date and time
+        current_time = datetime.now().strftime("%Y_%m_%d_%H:%M")
+        filename = f'fitness_{layer_name}_{current_time}.csv'
+
+        # Find the maximum length of lists
+        max_length = max(len(lst) for lst in lists_dict.values())
+
+        # Pad shorter lists with None
+        padded_lists = {key: lst + [None] * (max_length - len(lst)) for key, lst in lists_dict.items()}
+
+        # Save to CSV
+        with open(filename, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            # Write header
+            writer.writerow(padded_lists.keys())
+            # Write rows
+            for row in zip(*padded_lists.values()):
+                writer.writerow(row)
+        
+        print(f"Data saved to {filename}")
     
     def initialize_population(self):
         population = []
@@ -512,16 +562,16 @@ class MAGNETO:
                     matching_pairs.append((i, j))
 
         return matching_pairs
-    
+
     def crossover_tile(self, parents, crossover_prob=0.7):
         parent1, parent2 = parents
         offspring = []
         crossover_success = False
-        
+
         if random.random() < crossover_prob:
             idx1, idx2 = sorted(random.sample(range(1, 7), 2))
             idx3, idx4 = sorted(random.sample(range(8, 14), 2))
-            
+
             child1 = [gene[:] for gene in parent1]
             child2 = [gene[:] for gene in parent2]
 
@@ -529,18 +579,18 @@ class MAGNETO:
             child1[idx1][1], child2[idx2][1] = parent2[idx1][1], parent1[idx2][1]
             if not (self.check_constraints(child1[:7], level='l2') and self.check_constraints(child2[:7], level='l2')):
                 child1[idx1][1], child2[idx2][1] = parent1[idx1][1], parent2[idx2][1]
-            
+
             # Perform L1 crossover and check constraints
             child1[idx3][1], child2[idx4][1] = parent2[idx3][1], parent1[idx4][1]
             if not (self.check_constraints(child1[7:], level='l1') and self.check_constraints(child2[7:], level='l1')):
                 child1[idx3][1], child2[idx4][1] = parent1[idx3][1], parent2[idx4][1]
-            
+
             offspring.extend([child1, child2])
         else:
             offspring.extend([parent1, parent2])
 
         return offspring
-    
+
     def crossover_dim(self, parents, crossover_prob=0.7):
         parent1, parent2 = parents
         offspring = []
@@ -690,11 +740,13 @@ class MAGNETO:
             print(f"Generation {i + 1}......")
 
             elite_individual = population[best_idx]
+            population[0] = elite_individual
+            # print(f"Elite individual: {elite_individual}")
 
             # Step0: Track stagnation and apply restart if needed
             if best_fitness <= last_best_fitness:
                 no_improvement_generations += 1
-                print(f"No improvement for {no_improvement_generations} generations.")
+                # print(f"No improvement for {no_improvement_generations} generations.")
             else:
                 no_improvement_generations = 0
                 last_best_fitness = best_fitness
@@ -758,6 +810,7 @@ if __name__ == "__main__":
     parser.add_argument('--population', type=int, default=10, help='Number of populations')
     parser.add_argument('--model', type=str, default='single_conv', help='Model defined in data/model in MAESTO format')
     parser.add_argument('--hwconfig', type=str, default='mobile', choices=('mobile', 'cloud'), help='Hardware config defined in data/hw in MAESTRO format')
+    parser.add_argument('--power_budget_mw', type=int, default='1000', help='Power budget in mW')
     args = parser.parse_args()
     current_time = datetime.now().strftime("%Y_%m_%d")
     
@@ -767,14 +820,12 @@ if __name__ == "__main__":
         model_name=args.model,
         popluation_size=args.population,
         max_generations=args.generation,
+        power_constraint=args.power_budget_mw
     )
     dnn_layer_dict = model.extract_dimensions(f'data/model/{args.model}.m')
     best_mapper = model.run_ga(dimensions=dnn_layer_dict[0])
     
-    # Run the best individual
-    # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'final_result_{args.model}_{current_time}')
-    # final_mapping_file_path = model.create_mapping_file([best_mapper], dimensions=dnn_layer_dict[0], model_name=f'gamma_{args.model}_{current_time}')
-    
+    # Integrate the best mapper in the entire model
     final_mapping_file_path = model.integrate_dataflow_in_model(dnn_layer_dict[0], args.model, best_mapper)
     final_result_csv = model.run_maestro_to_get_all_metrics(final_mapping_file_path)
 
