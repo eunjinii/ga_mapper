@@ -582,12 +582,12 @@ class MAGNETO:
         else:
             return parent1, parent2
     
-    def mutate_tiles(self, mapper, mutation_prob=0.2):
+    def mutate_tiles(self, chromosome, mutation_prob=0.2):
         available_tile_sizes = self.get_available_tile_sizes()
         dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']
         max_attempts = 5
         
-        original_mapper = [gene[:] for gene in mapper]  # Save the original state
+        original_mapper = [gene[:] for gene in chromosome]  # Save the original state
         
         if random.random() < mutation_prob:
             mutation_success = False
@@ -598,35 +598,44 @@ class MAGNETO:
                 idx_l1 = random.randint(7, 12)
                 
                 # L2 Mapper mutation
-                valid_factors_l2 = available_tile_sizes['l2'][mapper[idx_l2][0]]
-                if mapper[idx_l2][0] in dim_list:
-                    mapper[idx_l2][1] = random.choice(valid_factors_l2)
+                valid_factors_l2 = available_tile_sizes['l2'][chromosome[idx_l2][0]]
+                if chromosome[idx_l2][0] in dim_list:
+                    chromosome[idx_l2][1] = random.choice(valid_factors_l2)
                 
                 # L1 Mapper mutation
-                valid_factors_l1 = available_tile_sizes['l1'][mapper[idx_l1][0]]
-                if mapper[idx_l1][0] in dim_list:
-                    mapper[idx_l1][1] = random.choice(valid_factors_l1)
+                valid_factors_l1 = available_tile_sizes['l1'][chromosome[idx_l1][0]]
+                if chromosome[idx_l1][0] in dim_list:
+                    chromosome[idx_l1][1] = random.choice(valid_factors_l1)
 
                 # Check constraints
-                if self.check_constraints_mapper(mapper[:6], level='l2') and \
-                self.check_constraints_mapper(mapper[7:], level='l1'):
+                if self.check_constraints_mapper(chromosome[:6], level='l2') and \
+                self.check_constraints_mapper(chromosome[7:], level='l1'):
                     mutation_success = True
                 else:
-                    mapper[idx_l2][1] = original_mapper[idx_l2][1]
-                    mapper[idx_l1][1] = original_mapper[idx_l1][1]
+                    chromosome[idx_l2][1] = original_mapper[idx_l2][1]
+                    chromosome[idx_l1][1] = original_mapper[idx_l1][1]
                     attempts += 1
 
             if not mutation_success:
-                mapper[:] = original_mapper
+                chromosome[:] = original_mapper
 
-        return mapper
+        return chromosome
+    
+    def mutate_shuffle(self, chromosome, mutation_prob=0.2):
+        if random.random() < mutation_prob:
+            l2_mapper = chromosome[:6]
+            random.shuffle(l2_mapper)
+        else:
+            l1_mapper = chromosome[7:]
+            random.shuffle(l1_mapper)
+        return chromosome
 
-    def mutate_pods(self, mapper, mutation_prob=0.2):
+    def mutate_pods(self, chromosome, mutation_prob=0.2):
         available_pod_sizes = self.get_available_pod_sizes()
         max_attempts = 5
         idx1 = 6  # Pod index
         
-        original_mapper = [gene[:] for gene in mapper]  # Save the original state
+        original_mapper = [gene[:] for gene in chromosome]  # Save the original state
         
         if random.random() < mutation_prob:
             mutation_success = False
@@ -634,30 +643,30 @@ class MAGNETO:
             
             # Loop until a valid mutation is found
             while not mutation_success and attempts < max_attempts:
-                mapper[idx1][1] = random.choice(available_pod_sizes)
+                chromosome[idx1][1] = random.choice(available_pod_sizes)
 
                 # Constraints validation
-                if self.check_constraints_mapper(mapper[:6], level='l2') and \
-                self.check_constraints_mapper(mapper[7:], level='l1'):
+                if self.check_constraints_mapper(chromosome[:6], level='l2') and \
+                self.check_constraints_mapper(chromosome[7:], level='l1'):
                     mutation_success = True
                 attempts += 1
 
                 if not mutation_success:
-                    mapper[idx1][1] = original_mapper[idx1][1]
+                    chromosome[idx1][1] = original_mapper[idx1][1]
 
-        return mapper
+        return chromosome
     
-    def replace_least_fit_individuals(self, population, offspring, pop_fitness_score_list):
-        """
-            Replace the least fit individuals in the population with the offspring
-        """
-        sorted_indices = sorted(range(len(pop_fitness_score_list)), key=lambda x: pop_fitness_score_list[x])
-        for i in range(len(offspring)):
-            worst_idx = sorted_indices[i]
-            population[worst_idx] = offspring[i]
-        return population
+    # def replace_least_fit_individuals(self, population, offspring, pop_fitness_score_list):
+    #     """
+    #         Replace the least fit individuals in the population with the offspring
+    #     """
+    #     sorted_indices = sorted(range(len(pop_fitness_score_list)), key=lambda x: pop_fitness_score_list[x])
+    #     for i in range(len(offspring)):
+    #         worst_idx = sorted_indices[i]
+    #         population[worst_idx] = offspring[i]
+    #     return population
     
-    def restart_population(self, population, fitness_scores, elite_ratio=0.1, random_ratio=0.2):
+    def replace_population(self, population, fitness_scores, elite_ratio=0.1, random_ratio=0.2):
         """
         - 상위 elite_ratio(%) 개체는 항상 유지 (엘리트)
         - 나머지 개체 중에서 일부(random_ratio%)를 랜덤 선택해 새로 초기화
@@ -703,17 +712,17 @@ class MAGNETO:
             elite_individual = population[best_idx]
             population[0] = elite_individual
 
-            # Step0: Track stagnation and apply restart if needed
+            # Step0: Track stagnation and apply replacement
             if best_fitness <= last_best_fitness:
                 no_improvement_generations += 1
             else:
                 no_improvement_generations = 0
                 last_best_fitness = best_fitness
             if no_improvement_generations >= 3:  # Stagnation threshold
-                population = self.restart_population(population, pop_fitness_score_list, elite_ratio=0.1, random_ratio=0.5)
+                population = self.replace_population(population, pop_fitness_score_list, elite_ratio=0.1, random_ratio=0.5)
                 no_improvement_generations = 0
             
-            # Step1: Select parents
+            # Step1: Selection
             selected_parents = []
             for _ in range(len(population) // 2):
                 parents = self.select_parents(population, pop_fitness_score_list)
@@ -730,7 +739,10 @@ class MAGNETO:
             
             # Step3: Mutation
             for individual in offspring:
-                if random.random() < 0.5:
+                # Randomly choose between tile mutation, shuffle mutation and pod mutation
+                if random.random() < 0.3:
+                    new_child = self.mutate_shuffle(individual, mutation_prob=0.8)
+                elif random.random() < 0.6:
                     new_child = self.mutate_tiles(individual, mutation_prob=0.8)
                 else:
                     new_child = self.mutate_pods(individual, mutation_prob=0.6)
