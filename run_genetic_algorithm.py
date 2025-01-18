@@ -94,11 +94,11 @@ class MAGNETO:
         parents = random.choices(population, weights=normalized_fitness_scores, k=2)
         return parents # [parent mapper1, parent mapper2]
     
-    def evaluate_chromosome(self, mapper):
+    def evaluate_chromosome(self, chromosome):
         freq_MHz = self.freq_MHz
 
         # Generate temporary mapping and run MAESTRO
-        temp_model_with_mapping_m = self.integrate_dataflow_in_model(self.model_name, mapper, is_temp=True)
+        temp_model_with_mapping_m = self.integrate_dataflow_in_model(self.model_name, chromosome, is_temp=True)
         temp_result_csv = self.run_maestro_to_get_all_metrics(temp_model_with_mapping_m)
         
         # Read CSV using pandas and convert to NumPy
@@ -259,7 +259,19 @@ class MAGNETO:
     def get_available_pod_sizes(self):
         return self.get_factors(self.num_PEs)
     
-    def check_constraints(self, mapper, level):
+    def check_constraints_cluster(self, pod): # [['P', cluster_size]]
+        """
+            Check if the pod size is valid
+        """
+        valid = True
+        if pod[0][0] == 1:
+            # print("Cluster size cannot be 1.")
+            valid = False
+        if pod > self.num_PEs:
+            valid = False
+        return valid
+    
+    def check_constraints_mapper(self, mapper, level): # single l1 or l2 mapper [[dim, tile_size], ...]
         """
             Single level of a mapper
         """
@@ -267,9 +279,9 @@ class MAGNETO:
         dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']
         
         # Check if 'P' is fixed as the first dimension
-        if mapper[0][0] != 'P':
-            # print("First gene must be 'P'")
-            valid = False
+        # if mapper[0][0] != 'P':
+        #     # print("First gene must be 'P'")
+        #     valid = False
             
         # Check if there are duplicate dimensions
         dimensions = [gene[0] for gene in mapper]
@@ -277,10 +289,9 @@ class MAGNETO:
             # print(f"Duplicate dimensions detected: {dimensions}")
             valid = False
         
-        # Check if there is X or Y in L2 mapper index 1
+        # Check if there is X or Y in L2 mapper index 0
         if level == 'l2':
-            if mapper[1][0] in {'X', 'Y'}:
-                # print("X or Y cannot be in L2 mapper")
+            if mapper[0][0] in {'X', 'Y'}:
                 valid = False
         
         # Check if there is R or S with tile size not equal to the dimension
@@ -297,28 +308,28 @@ class MAGNETO:
             
         # Check if the cluster dimension is less than or equal to the number of PEs
         if level == 'l1':
-            cluster_size = mapper[0][1]  # Cluster 크기 (m 값)
-            spatial_size = mapper[1][1]  # SpatialMap 크기 (n 값)
+            # cluster_size = mapper[0][1]  # Cluster 크기 (m 값)
+            spatial_size = mapper[0][1]  # SpatialMap 크기 (n 값)
             
             # 1. PE 수 초과 확인
-            if cluster_size > self.num_PEs or cluster_size <= 0:
-                # print(f"Invalid Cluster size: {cluster_size}. Must be within PE limit.")
-                valid = False
+            # if cluster_size > self.num_PEs or cluster_size <= 0:
+            #     # print(f"Invalid Cluster size: {cluster_size}. Must be within PE limit.")
+            #     valid = False
 
             # 2. Cluster 크기 >= SpatialMap 크기 확인
-            if cluster_size < spatial_size:
-                # print(f"SpatialMap size {spatial_size} cannot exceed Cluster size {cluster_size}.")
-                valid = False
+            # if cluster_size < spatial_size:
+            #     # print(f"SpatialMap size {spatial_size} cannot exceed Cluster size {cluster_size}.")
+            #     valid = False
             
             # 3. 유효한 매핑 차원 확인
-            if mapper[0][0] != 'P':
-                # print(f"Invalid mapping dimensions: {mapper[0][0]}. Expected 'P'.")
-                valid = False
+            # if mapper[0][0] != 'P':
+            #     # print(f"Invalid mapping dimensions: {mapper[0][0]}. Expected 'P'.")
+            #     valid = False
 
             # 4. PE가 1개일 경우 비허용
-            if cluster_size == 1:
-                # print("Cluster size cannot be 1.")
-                valid = False
+            # if cluster_size == 1:
+            #     # print("Cluster size cannot be 1.")
+            #     valid = False
         
         return valid
 
@@ -327,12 +338,8 @@ class MAGNETO:
         Encodes a mapper level by choosing spatial and temporal dimensions with valid factors.
         """
         dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']
-        sp = random.choice(dim_list)
-        sp_factors = self.get_factors(dimensions[sp])
-        valid_factors = [f for f in sp_factors if 2 <= f <= min(dimensions[sp], self.num_PEs)]
-        sp_sz = random.choice(valid_factors) if valid_factors else 1
-
-        df = []
+        mapper = []
+        
         for dim_name in dim_list:
             factors = self.get_factors(dimensions[dim_name])
             if dim_name in {'R', 'S'}:
@@ -341,15 +348,14 @@ class MAGNETO:
                 tile_size = 1 if level == 'l2' else random.choice([f for f in factors if f <= dimensions[dim_name]])
             else:
                 tile_size = random.choice([f for f in factors if f <= dimensions[dim_name]])
-            df.append([dim_name, tile_size])
+            mapper.append([dim_name, tile_size])
 
-        random.shuffle(df)
+        random.shuffle(mapper)
         if level == 'l2':
-            while df[0][0] in {'X', 'Y'}:
-                random.shuffle(df)
-        mapper = [['P', sp_sz]] + df
+            while mapper[0][0] in {'X', 'Y'}:
+                random.shuffle(mapper)
 
-        return mapper # [['P', 3], ...]
+        return mapper # [['K', 3], ...]
 
     def find_best_score(self, pop_fitness_score_list):
         best_score = max(pop_fitness_score_list)
@@ -357,52 +363,46 @@ class MAGNETO:
         return best_score, best_idx
 
     def create_chromosome(self):
+        dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']
+        sp = random.choice(dim_list)
+        sp_factors = self.get_factors(self.dimensions[sp])
+        valid_factors = [f for f in sp_factors if 2 <= f <= min(self.dimensions[sp], self.num_PEs)]
+        cluster_size = random.choice(valid_factors) if valid_factors else 1
+        
         l2_mapper = self.encode_mapper(self.dimensions, level='l2')
         l1_mapper = self.encode_mapper(self.dimensions, level='l1')
-        return l2_mapper + l1_mapper
+        return l2_mapper + [['P', cluster_size]] + l1_mapper
 
     def create_dataflow_template_string(self, mapper):
         dataflow_template = ''
-        dataflow_template += "\t\tDataflow {\n"
-
-        l2_mapper, l1_mapper = mapper[:7], mapper[7:]
-
-        for i, mapping in enumerate([l2_mapper, l1_mapper]):
-            if i == 0: # L2
-                for j, (dim, tile_size) in enumerate(mapping[1:]):
-                    if j == 0:
-                        if dim == 'R':
-                            dataflow_template += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
-                        elif dim == 'S':
-                            dataflow_template += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
-                        else:
-                            dataflow_template += f"\t\t\tSpatialMap({tile_size},{tile_size}) {dim};\n"
+        dataflow_template += "\t\tDataflow {\n"        
+        
+        def create_mapper_string(mapper):
+            mapper_string = ''
+            for i, (dim, tile_size) in enumerate(mapper):
+                if i == 0:
+                    if dim == 'R':
+                        mapper_string += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
+                    elif dim == 'S':
+                        mapper_string += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
                     else:
-                        if dim == 'R':
-                            dataflow_template += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
-                        elif dim == 'S':
-                            dataflow_template += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
-                        else:
-                            dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
-            else: # L1
-                for j, (dim, tile_size) in enumerate(mapping):
-                    if j == 0:
-                        dataflow_template += f"\t\t\tCluster({tile_size}, {dim});\n"
-                    elif j == 1:
-                        if dim == 'R':
-                            dataflow_template += f"\t\t\tSpatialMap(Sz(R),Sz(R)) R;\n"
-                        elif dim == 'S':
-                            dataflow_template += f"\t\t\tSpatialMap(Sz(S),Sz(S)) S;\n"
-                        else:
-                            dataflow_template += f"\t\t\tSpatialMap({tile_size}, {tile_size}) {dim};\n"
+                        mapper_string += f"\t\t\tSpatialMap({tile_size},{tile_size}) {dim};\n" 
+                else:
+                    if dim == 'R':
+                        mapper_string += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
+                    elif dim == 'S':
+                        mapper_string += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
                     else:
-                        if dim == 'R':
-                            dataflow_template += f"\t\t\tTemporalMap(Sz(R),Sz(R)) R;\n"
-                        elif dim == 'S':
-                            dataflow_template += f"\t\t\tTemporalMap(Sz(S),Sz(S)) S;\n"
-                        else:
-                            dataflow_template += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
+                        mapper_string += f"\t\t\tTemporalMap({tile_size}, {tile_size}) {dim};\n"
+            return mapper_string
+        
+        l2_mapper, cluster, l1_mapper = mapper[:6], mapper[6], mapper[7:] # [['K', 3], ...]
+        
+        dataflow_template += create_mapper_string(l2_mapper)
+        dataflow_template += f"\t\t\tCluster({cluster[1]}, P);\n"
+        dataflow_template += create_mapper_string(l1_mapper)
         dataflow_template += "\t\t}\n"
+
         return dataflow_template
     
     def integrate_dataflow_in_model(self, model_name, mapper, is_temp=False):
@@ -499,18 +499,18 @@ class MAGNETO:
                 temp_child1 = [gene[:] for gene in parent1]
                 temp_child2 = [gene[:] for gene in parent2]
 
-                idx1, idx2 = sorted(random.sample(range(1, 7), 2))
-                idx3, idx4 = sorted(random.sample(range(8, 14), 2))
+                idx1, idx2 = sorted(random.sample(range(0, 6), 2))
+                idx3, idx4 = sorted(random.sample(range(7, 13), 2))
 
                 # Perform L2 crossover
                 temp_child1[idx1][1], temp_child2[idx2][1] = parent2[idx1][1], parent1[idx2][1]
-                valid_l2 = self.check_constraints(temp_child1[:7], level='l2') and self.check_constraints(temp_child2[:7], level='l2')
+                valid_l2 = self.check_constraints_mapper(temp_child1[:6], level='l2') and self.check_constraints_mapper(temp_child2[:6], level='l2')
                 if not valid_l2:
                     temp_child1[idx1][1], temp_child2[idx2][1] = parent1[idx1][1], parent2[idx2][1]  # Revert
 
                 # Perform L1 crossover
                 temp_child1[idx3][1], temp_child2[idx4][1] = parent2[idx3][1], parent1[idx4][1]
-                valid_l1 = self.check_constraints(temp_child1[7:], level='l1') and self.check_constraints(temp_child2[7:], level='l1')
+                valid_l1 = self.check_constraints_mapper(temp_child1[7:], level='l1') and self.check_constraints_mapper(temp_child2[7:], level='l1')
                 if not valid_l1:
                     temp_child1[idx3][1], temp_child2[idx4][1] = parent1[idx3][1], parent2[idx4][1]  # Revert
 
@@ -541,8 +541,8 @@ class MAGNETO:
 
             # 가능한 차원 쌍 후보를 수집
             # L2 범위: 1~6, L1 범위: 8~13
-            l2_dim_pairs = self.get_matching_dim_pairs(child1, child2, start=1, end=7)
-            l1_dim_pairs = self.get_matching_dim_pairs(child1, child2, start=8, end=14)
+            l2_dim_pairs = self.get_matching_dim_pairs(child1, child2, start=0, end=6)
+            l1_dim_pairs = self.get_matching_dim_pairs(child1, child2, start=7, end=13)
 
             def perform_crossover(mapper1, mapper2, dim_pairs): # 원본데이터에 바로 반영됨
                 if dim_pairs: # [(idx1_child1, idx2_child2), ...]
@@ -561,13 +561,13 @@ class MAGNETO:
 
                 # Validate temp_child1
                 valid_child1 = (
-                    self.check_constraints(temp_child1[:7], level='l2') and
-                    self.check_constraints(temp_child1[7:], level='l1')
+                    self.check_constraints_mapper(temp_child1[:6], level='l2') and
+                    self.check_constraints_mapper(temp_child1[7:], level='l1')
                 )
                 # Validate temp_child2
                 valid_child2 = (
-                    self.check_constraints(temp_child2[:7], level='l2') and
-                    self.check_constraints(temp_child2[7:], level='l1')
+                    self.check_constraints_mapper(temp_child2[:6], level='l2') and
+                    self.check_constraints_mapper(temp_child2[7:], level='l1')
                 )
 
                 if valid_child1 or valid_child2:
@@ -594,8 +594,8 @@ class MAGNETO:
             attempts = 0
 
             while not mutation_success and attempts < max_attempts:
-                idx_l2 = random.randint(1, 6)
-                idx_l1 = random.randint(8, 13)
+                idx_l2 = random.randint(0, 5)
+                idx_l1 = random.randint(7, 12)
                 
                 # L2 Mapper mutation
                 valid_factors_l2 = available_tile_sizes['l2'][mapper[idx_l2][0]]
@@ -608,8 +608,8 @@ class MAGNETO:
                     mapper[idx_l1][1] = random.choice(valid_factors_l1)
 
                 # Check constraints
-                if self.check_constraints(mapper[:7], level='l2') and \
-                self.check_constraints(mapper[7:], level='l1'):
+                if self.check_constraints_mapper(mapper[:6], level='l2') and \
+                self.check_constraints_mapper(mapper[7:], level='l1'):
                     mutation_success = True
                 else:
                     mapper[idx_l2][1] = original_mapper[idx_l2][1]
@@ -624,7 +624,7 @@ class MAGNETO:
     def mutate_pods(self, mapper, mutation_prob=0.2):
         available_pod_sizes = self.get_available_pod_sizes()
         max_attempts = 5
-        idx1 = 7  # Pod index
+        idx1 = 6  # Pod index
         
         original_mapper = [gene[:] for gene in mapper]  # Save the original state
         
@@ -637,8 +637,8 @@ class MAGNETO:
                 mapper[idx1][1] = random.choice(available_pod_sizes)
 
                 # Constraints validation
-                if self.check_constraints(mapper[:7], level='l2') and \
-                self.check_constraints(mapper[7:], level='l1'):
+                if self.check_constraints_mapper(mapper[:6], level='l2') and \
+                self.check_constraints_mapper(mapper[7:], level='l1'):
                     mutation_success = True
                 attempts += 1
 
