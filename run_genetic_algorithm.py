@@ -6,8 +6,9 @@ import numpy as np
 import csv
 import re
 import argparse
+import copy
 from datetime import datetime
-    
+
 class MAGNETO:
     def __init__(self, hw_config='', model_name='', popluation_size=100, max_generations=10, power_constraint=1000):
         super(MAGNETO,self).__init__()
@@ -96,16 +97,14 @@ class MAGNETO:
     
     def evaluate_chromosome(self, chromosome):
         freq_MHz = self.freq_MHz
-
         # Generate temporary mapping and run MAESTRO
         temp_model_with_mapping_m = self.integrate_dataflow_in_model(self.model_name, chromosome, is_temp=True)
         temp_result_csv = self.run_maestro_to_get_all_metrics(temp_model_with_mapping_m)
         
         # Read CSV using pandas and convert to NumPy
         df = pd.read_csv(temp_result_csv)
-        data = df.to_numpy()  # Convert entire DataFrame to NumPy array for efficient processing
+        data = df.to_numpy()
 
-        # Column indices based on CSV structure (replace with actual indices as necessary)
         runtime_col = df.columns.get_loc(' Runtime (Cycles)')
         energy_col = df.columns.get_loc(' Activity count-based Energy (nJ)')
         l1_read_col = df.columns.get_loc(' input l1 read')
@@ -160,7 +159,7 @@ class MAGNETO:
         # Fitness score calculation
         offset = 5
         # fitness_score = 0.3 * norm_averaged_reuse_factor - 0.5 * norm_edp - 0.2 * norm_weighted_memory_access + offset
-        fitness_score = - 0.6 * norm_edp - 0.4 * norm_weighted_memory_access + offset # reuse_factor increases as memory access decreases
+        fitness_score = - 0.7 * norm_cycles + 0.3 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
         if power_proxy_value > self.power_constraint:
             fitness_score = -100
 
@@ -175,7 +174,6 @@ class MAGNETO:
     def evaluate_population(self, population):
         pop_fitness_score_list = [] # [calculated fitness score * population_size]
         pop_performance_list = [] # [(fitness1 value, fitness2 value) * population_size]
-
         for chromosome in population:
             fitness_score, performance = self.evaluate_chromosome(chromosome)
             pop_fitness_score_list.append(fitness_score)
@@ -264,72 +262,46 @@ class MAGNETO:
             Check if the pod size is valid
         """
         valid = True
-        if pod[0][0] == 1:
+        # if pod[0][0] == 1:
             # print("Cluster size cannot be 1.")
-            valid = False
+            # valid = False
         if pod > self.num_PEs:
             valid = False
         return valid
     
-    def check_constraints_mapper(self, mapper, level): # single l1 or l2 mapper [[dim, tile_size], ...]
+    def check_mapspace_validity(self, mapper, level, cluster_size=None): # chromosome slice: single l1 or l2 mapper [[dim, tile_size], ...]
         """
             Single level of a mapper
         """
         valid = True
-        dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']
         
-        # Check if 'P' is fixed as the first dimension
-        # if mapper[0][0] != 'P':
-        #     # print("First gene must be 'P'")
-        #     valid = False
-            
+        if cluster_size:
+            print("Cluster size should not exceed PE size")
+            return self.check_constraints_cluster(cluster_size)
+
         # Check if there are duplicate dimensions
         dimensions = [gene[0] for gene in mapper]
         if len(dimensions) != len(set(dimensions)):
-            # print(f"Duplicate dimensions detected: {dimensions}")
+            print("\tDuplicate dimensions found.")
             valid = False
         
         # Check if there is X or Y in L2 mapper index 0
-        if level == 'l2':
-            if mapper[0][0] in {'X', 'Y'}:
-                valid = False
+        # if level == 'l2':
+        #     if mapper[0][0] in {'X', 'Y'}:
+        #         print("X and Y must be in TemporalMap.")
+        #         valid = False
         
         # Check if there is R or S with tile size not equal to the dimension
-        for i, (dim, tile_size) in enumerate(mapper):
+        for _, (dim, tile_size) in enumerate(mapper):
             if dim in {'R', 'S'} and tile_size != self.dimensions[dim]:
-                # print(f"Tile size of {dim} must be equal to the dimension")
+                print(f"\tTile size of {dim} must be equal to the dimension")
                 valid = False
                 break
             # Check if X and Y in l2 is equal to 1
             if level == 'l2' and dim in {'X', 'Y'} and tile_size != 1:
-                # print("Tile size of X and Y in L2 must be equal to 1")
+                print("\tTile size of X and Y in L2 must be equal to 1")
                 valid = False
                 break
-            
-        # Check if the cluster dimension is less than or equal to the number of PEs
-        if level == 'l1':
-            # cluster_size = mapper[0][1]  # Cluster 크기 (m 값)
-            spatial_size = mapper[0][1]  # SpatialMap 크기 (n 값)
-            
-            # 1. PE 수 초과 확인
-            # if cluster_size > self.num_PEs or cluster_size <= 0:
-            #     # print(f"Invalid Cluster size: {cluster_size}. Must be within PE limit.")
-            #     valid = False
-
-            # 2. Cluster 크기 >= SpatialMap 크기 확인
-            # if cluster_size < spatial_size:
-            #     # print(f"SpatialMap size {spatial_size} cannot exceed Cluster size {cluster_size}.")
-            #     valid = False
-            
-            # 3. 유효한 매핑 차원 확인
-            # if mapper[0][0] != 'P':
-            #     # print(f"Invalid mapping dimensions: {mapper[0][0]}. Expected 'P'.")
-            #     valid = False
-
-            # 4. PE가 1개일 경우 비허용
-            # if cluster_size == 1:
-            #     # print("Cluster size cannot be 1.")
-            #     valid = False
         
         return valid
 
@@ -462,122 +434,74 @@ class MAGNETO:
             population.append(mapper)
         return population
     
-    def get_matching_dim_pairs(self, child1, child2, start, end):
+    @staticmethod
+    def get_matching_dim_index_pairs(slice1, slice2, avaliable_dims=['K', 'C', 'R', 'S', 'Y', 'X']):
         """
-        child1, child2 내의 동일 차원 이름을 갖는 인덱스 쌍을 반환한다.
-        start, end 범위 내에서 탐색.
-        반환 예: [(idx1_child1, idx2_child2), ...]
+        Return index pairs of matching dimensions between two slices
+        Return: [(0, 3), (3, 2)...]
         """
-        dim_map_child2 = {}
-        # child2의 차원별 인덱스 모음
-        for i in range(start, end):
-            dim_name = child2[i][0]
-            if dim_name not in dim_map_child2:
-                dim_map_child2[dim_name] = []
-            dim_map_child2[dim_name].append(i)
-
         matching_pairs = []
-        # child1의 각 인덱스에 대해 동일 차원 이름을 child2에서 찾는다
-        for i in range(start, end):
-            dim_name = child1[i][0]
-            if dim_name in dim_map_child2:
-                for j in dim_map_child2[dim_name]:
+        for i, (dim1, _) in enumerate(slice1):
+            for j, (dim2, _) in enumerate(slice2):
+                if dim1 == dim2 and dim1 in avaliable_dims:
                     matching_pairs.append((i, j))
-
         return matching_pairs
 
-    def crossover_tile(self, parents, crossover_prob=0.7, max_retries=5):
+    def crossover(self, parents, crossover_prob=0.7, max_retries=5):
+        if random.random() >= crossover_prob: return parents
+
         parent1, parent2 = parents
-        child1, child2 = None, None
+        child1 = copy.deepcopy(parent1)
+        child2 = copy.deepcopy(parent2)
 
-        if random.random() < crossover_prob:
-            retries = 0
-            valid_child1, valid_child2 = False, False
+        def cross_dims(slice1, slice2, dim_pairs):
+            if not dim_pairs: return slice1, slice2
 
-            while retries < max_retries:
-                # Create temporary children for retry
-                temp_child1 = [gene[:] for gene in parent1]
-                temp_child2 = [gene[:] for gene in parent2]
-
-                idx1, idx2 = sorted(random.sample(range(0, 6), 2))
-                idx3, idx4 = sorted(random.sample(range(7, 13), 2))
-
-                # Perform L2 crossover
-                temp_child1[idx1][1], temp_child2[idx2][1] = parent2[idx1][1], parent1[idx2][1]
-                valid_l2 = self.check_constraints_mapper(temp_child1[:6], level='l2') and self.check_constraints_mapper(temp_child2[:6], level='l2')
-                if not valid_l2:
-                    temp_child1[idx1][1], temp_child2[idx2][1] = parent1[idx1][1], parent2[idx2][1]  # Revert
-
-                # Perform L1 crossover
-                temp_child1[idx3][1], temp_child2[idx4][1] = parent2[idx3][1], parent1[idx4][1]
-                valid_l1 = self.check_constraints_mapper(temp_child1[7:], level='l1') and self.check_constraints_mapper(temp_child2[7:], level='l1')
-                if not valid_l1:
-                    temp_child1[idx3][1], temp_child2[idx4][1] = parent1[idx3][1], parent2[idx4][1]  # Revert
-
-                # Validate both children
-                valid_child1 = valid_l2 and valid_l1
-                valid_child2 = valid_l2 and valid_l1
-
-                if valid_child1 or valid_child2:
-                    child1 = temp_child1 if valid_child1 else parent1
-                    child2 = temp_child2 if valid_child2 else parent2
-                    break  # Exit retry loop if valid children are created
-
-                retries += 1
-
-            child1 = parent1 if not valid_child1 else child1
-            child2 = parent2 if not valid_child2 else child2
-            return child1, child2
-        else:
-            return parent1, parent2
-
-    def crossover_dim(self, parents, crossover_prob=0.7, max_retries=5):
-        parent1, parent2 = parents
-        child1, child2 = None, None
-        
-        if random.random() < crossover_prob:
-            child1 = [gene[:] for gene in parent1]
-            child2 = [gene[:] for gene in parent2]
-
-            # 가능한 차원 쌍 후보를 수집
-            # L2 범위: 1~6, L1 범위: 8~13
-            l2_dim_pairs = self.get_matching_dim_pairs(child1, child2, start=0, end=6)
-            l1_dim_pairs = self.get_matching_dim_pairs(child1, child2, start=7, end=13)
-
-            def perform_crossover(mapper1, mapper2, dim_pairs): # 원본데이터에 바로 반영됨
-                if dim_pairs: # [(idx1_child1, idx2_child2), ...]
-                    idx1, idx2 = random.choice(dim_pairs)
-                    mapper1[idx1], mapper2[idx2] = mapper2[idx1], mapper1[idx2]
-
-            retries = 0
-            valid_child1, valid_child2 = False, False
-
-            while retries < max_retries:
-                temp_child1 = [gene[:] for gene in parent1]
-                temp_child2 = [gene[:] for gene in parent2]
-
-                perform_crossover(temp_child1, temp_child2, l2_dim_pairs)
-                perform_crossover(temp_child1, temp_child2, l1_dim_pairs)
-
-                # Validate temp_child1
-                valid_child1 = (
-                    self.check_constraints_mapper(temp_child1[:6], level='l2') and
-                    self.check_constraints_mapper(temp_child1[7:], level='l1')
-                )
-                # Validate temp_child2
-                valid_child2 = (
-                    self.check_constraints_mapper(temp_child2[:6], level='l2') and
-                    self.check_constraints_mapper(temp_child2[7:], level='l1')
-                )
-
-                if valid_child1 or valid_child2:
-                    child1 = temp_child1 if valid_child1 else child1
-                    child2 = temp_child2 if valid_child2 else child2
-                    break
-                retries += 1
+            crossed_slice1 = copy.deepcopy(slice1)
+            crossed_slice2 = copy.deepcopy(slice2)
             
-            child1 = parent1 if not valid_child1 else child1
-            child2 = parent2 if not valid_child2 else child2
+            idx1, idx2 = random.choice(dim_pairs)
+            crossed_slice1[idx1], crossed_slice2[idx2] = slice2[idx2], slice1[idx1]
+            return crossed_slice1, crossed_slice2
+        
+        rand_value = random.random()
+        
+        if rand_value < 0.4: # intra-level crossover
+            dim_pairs1 = self.get_matching_dim_index_pairs(parent1[:6], parent2[:6])
+            dim_pairs2 = self.get_matching_dim_index_pairs(parent1[7:], parent2[7:])
+            child1_slice1, child2_slice1 = cross_dims(parent1[:6], parent2[:6], dim_pairs1) # l1
+            child1_slice2, child2_slice2 = cross_dims(parent1[7:], parent2[7:], dim_pairs2) # l2
+            
+            child1 = child1_slice1 + [['P', parent1[6][1]]] + child1_slice2
+            child2 = child2_slice1 + [['P', parent2[6][1]]] + child2_slice2
+        
+        elif rand_value < 0.7: # inter-level crossover
+            dim_pairs1 = self.get_matching_dim_index_pairs(parent1[:6], parent2[7:], avaliable_dims=['K', 'C', 'R', 'S'])
+            dim_pairs2 = self.get_matching_dim_index_pairs(parent1[7:], parent2[:6], avaliable_dims=['K', 'C', 'R', 'S'])
+            child1_slice1, child2_slice2 = cross_dims(parent1[:6], parent2[7:], dim_pairs1)
+            child1_slice2, child2_slice1 = cross_dims(parent1[7:], parent2[:6], dim_pairs2)
+            
+            child1 = child1_slice1 + [['P', parent1[6][1]]] + child1_slice2
+            child2 = child2_slice1 + [['P', parent2[6][1]]] + child2_slice2
+        
+        else: # cluster crossover
+            child1 = parent1[:6] + [['P', parent2[6][1]]] + parent1[7:]
+            child2 = parent2[:6] + [['P', parent1[6][1]]] + parent2[7:]
+            
+        valid_slice1 = (
+            self.check_mapspace_validity(child1[:6], level='l2') and
+            self.check_mapspace_validity(child1[7:], level='l1')
+        )
+        valid_slice2 = (
+            self.check_mapspace_validity(child2[:6], level='l2') and
+            self.check_mapspace_validity(child2[7:], level='l1')
+        )
+        valid_cluster = (
+            self.check_constraints_cluster(child1[6][1]) and 
+            self.check_constraints_cluster(child2[6][1])
+        )
+
+        if valid_slice1 and valid_slice2 and valid_cluster:
             return child1, child2
         else:
             return parent1, parent2
@@ -608,8 +532,8 @@ class MAGNETO:
                     chromosome[idx_l1][1] = random.choice(valid_factors_l1)
 
                 # Check constraints
-                if self.check_constraints_mapper(chromosome[:6], level='l2') and \
-                self.check_constraints_mapper(chromosome[7:], level='l1'):
+                if self.check_mapspace_validity(chromosome[:6], level='l2') and \
+                self.check_mapspace_validity(chromosome[7:], level='l1'):
                     mutation_success = True
                 else:
                     chromosome[idx_l2][1] = original_mapper[idx_l2][1]
@@ -630,7 +554,7 @@ class MAGNETO:
             random.shuffle(l1_mapper)
         return chromosome
 
-    def mutate_pods(self, chromosome, mutation_prob=0.2):
+    def mutate_cluster(self, chromosome, mutation_prob=0.2):
         available_pod_sizes = self.get_available_pod_sizes()
         max_attempts = 5
         idx1 = 6  # Pod index
@@ -646,8 +570,8 @@ class MAGNETO:
                 chromosome[idx1][1] = random.choice(available_pod_sizes)
 
                 # Constraints validation
-                if self.check_constraints_mapper(chromosome[:6], level='l2') and \
-                self.check_constraints_mapper(chromosome[7:], level='l1'):
+                if self.check_mapspace_validity(chromosome[:6], level='l2') and \
+                self.check_mapspace_validity(chromosome[7:], level='l1'):
                     mutation_success = True
                 attempts += 1
 
@@ -655,17 +579,7 @@ class MAGNETO:
                     chromosome[idx1][1] = original_mapper[idx1][1]
 
         return chromosome
-    
-    # def replace_least_fit_individuals(self, population, offspring, pop_fitness_score_list):
-    #     """
-    #         Replace the least fit individuals in the population with the offspring
-    #     """
-    #     sorted_indices = sorted(range(len(pop_fitness_score_list)), key=lambda x: pop_fitness_score_list[x])
-    #     for i in range(len(offspring)):
-    #         worst_idx = sorted_indices[i]
-    #         population[worst_idx] = offspring[i]
-    #     return population
-    
+
     def replace_population(self, population, fitness_scores, elite_ratio=0.1, random_ratio=0.2):
         """
         - 상위 elite_ratio(%) 개체는 항상 유지 (엘리트)
@@ -731,21 +645,19 @@ class MAGNETO:
             # Step2: Crossover
             offspring = []
             for parent1, parent2 in selected_parents: # len(population) // 2 times
-                if random.random() < 0.5:
-                    child1, child2 = self.crossover_tile([parent1, parent2], crossover_prob=0.6)
-                else:
-                    child1, child2 = self.crossover_dim([parent1, parent2], crossover_prob=0.8)
+                # Randomly choose between inter-level, intra-level and cluster crossover
+                child1, child2 = self.crossover([parent1, parent2], crossover_prob=0.6)
                 offspring.extend([child1, child2]) # len(offspring) == len(population)
             
-            # Step3: Mutation
+            # # Step3: Mutation
             for individual in offspring:
-                # Randomly choose between tile mutation, shuffle mutation and pod mutation
+                # Randomly choose between tile mutation, shuffle mutation and cluster mutation
                 if random.random() < 0.3:
                     new_child = self.mutate_shuffle(individual, mutation_prob=0.8)
                 elif random.random() < 0.6:
                     new_child = self.mutate_tiles(individual, mutation_prob=0.8)
                 else:
-                    new_child = self.mutate_pods(individual, mutation_prob=0.6)
+                    new_child = self.mutate_cluster(individual, mutation_prob=0.6)
                 individual[:] = new_child
             
             population = offspring
