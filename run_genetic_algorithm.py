@@ -26,12 +26,13 @@ class MAGNETO:
         self.popluation_size = popluation_size
         self.max_generations = max_generations
         self.power_constraint = power_constraint
+        self.elite_size = popluation_size * 0.1
         
         self.best_fitness = -1
-        self.best_perf_fitness1 = float('inf') # latency
-        self.best_perf_fitness2 = 0 # utilization
-        self.best_perf_fitness3 = float('inf') # memory access
-        self.best_perf_fitness4 = 0 # reuse factor
+        self.best_perf1 = float('inf') # latency
+        self.best_perf2 = 0 # utilization
+        self.best_perf3 = float('inf') # memory access
+        self.best_perf4 = 0 # reuse factor
         
         self.max_cycles = None
         self.max_weighted_memory_access = None
@@ -40,10 +41,10 @@ class MAGNETO:
         self.energy_nJ = None
         
         self.best_fitness_score_list = [] # [fitness score] * generation size
-        self.best_perf_fitness1_list = [] # [metric1 value] * generation size
-        self.best_perf_fitness2_list = []
-        self.best_perf_fitness3_list = []
-        self.best_perf_fitness4_list = []
+        self.best_perf1_list = [] # [metric1 value] * generation size
+        self.best_perf2_list = []
+        self.best_perf3_list = []
+        self.best_perf4_list = []
         self.best_mapper_list = []
 
     def run_maestro_to_get_all_metrics(self, mapping_file_path):
@@ -160,8 +161,11 @@ class MAGNETO:
         offset = 5
         # fitness_score = 0.3 * norm_averaged_reuse_factor - 0.5 * norm_edp - 0.2 * norm_weighted_memory_access + offset
         fitness_score = - 0.7 * norm_cycles + 0.3 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
+        # if power_proxy_value > self.power_constraint:
+        #     fitness_score = -100
         if power_proxy_value > self.power_constraint:
-            fitness_score = -100
+            fitness_score -= ((power_proxy_value - self.power_constraint) / self.power_constraint) * 10
+
 
         # Cleanup temporary files
         if os.path.exists(temp_model_with_mapping_m):
@@ -172,22 +176,20 @@ class MAGNETO:
         return fitness_score, (cycles, edp, weighted_memory_access, averaged_reuse_factor)
 
     def evaluate_population(self, population):
-        pop_fitness_score_list = [] # [calculated fitness score * population_size]
-        pop_performance_list = [] # [(fitness1 value, fitness2 value) * population_size]
+        evaluated_pop = []
         for chromosome in population:
             fitness_score, performance = self.evaluate_chromosome(chromosome)
-            pop_fitness_score_list.append(fitness_score)
-            pop_performance_list.append(performance)
+            evaluated_pop.append((chromosome, fitness_score, performance))
         
-        best_idx = np.argmax(pop_fitness_score_list)
-        self.best_fitness_score_list.append(pop_fitness_score_list[best_idx])
-        self.best_perf_fitness1_list.append(pop_performance_list[best_idx][0]) # cycles
-        self.best_perf_fitness2_list.append(pop_performance_list[best_idx][1]) # edp
-        self.best_perf_fitness3_list.append(pop_performance_list[best_idx][2]) # weighted memory access
-        self.best_perf_fitness4_list.append(pop_performance_list[best_idx][3]) # averaged reuse factor
-        self.best_mapper_list.append(population[best_idx])
+        best_idx = np.argmax([x[1] for x in evaluated_pop])
+        self.best_mapper_list.append(evaluated_pop[best_idx][0])
+        self.best_fitness_score_list.append(evaluated_pop[best_idx][1])
+        self.best_perf1_list.append(evaluated_pop[best_idx][2][0]) # cycles
+        self.best_perf2_list.append(evaluated_pop[best_idx][2][1])
+        self.best_perf3_list.append(evaluated_pop[best_idx][2][2])
+        self.best_perf4_list.append(evaluated_pop[best_idx][2][3])
             
-        return pop_fitness_score_list, pop_performance_list
+        return evaluated_pop # [(chromosome, fitness, (per1, perf2)), ...]
 
     @staticmethod
     def extract_dimensions(file_path):
@@ -261,36 +263,20 @@ class MAGNETO:
         """
             Check if the pod size is valid
         """
-        valid = True
-        # if pod[0][0] == 1:
-            # print("Cluster size cannot be 1.")
-            # valid = False
-        if pod > self.num_PEs:
-            valid = False
-        return valid
+        return pod <= self.num_PEs
     
-    def check_mapspace_validity(self, mapper, level, cluster_size=None): # chromosome slice: single l1 or l2 mapper [[dim, tile_size], ...]
+    def check_mapspace_validity(self, mapper, level): # chromosome slice: single l1 or l2 mapper [[dim, tile_size], ...]
         """
             Single level of a mapper
         """
         valid = True
-        
-        if cluster_size:
-            print("Cluster size should not exceed PE size")
-            return self.check_constraints_cluster(cluster_size)
 
         # Check if there are duplicate dimensions
         dimensions = [gene[0] for gene in mapper]
         if len(dimensions) != len(set(dimensions)):
             print("\tDuplicate dimensions found.")
             valid = False
-        
-        # Check if there is X or Y in L2 mapper index 0
-        # if level == 'l2':
-        #     if mapper[0][0] in {'X', 'Y'}:
-        #         print("X and Y must be in TemporalMap.")
-        #         valid = False
-        
+
         # Check if there is R or S with tile size not equal to the dimension
         for _, (dim, tile_size) in enumerate(mapper):
             if dim in {'R', 'S'} and tile_size != self.dimensions[dim]:
@@ -329,9 +315,9 @@ class MAGNETO:
 
         return mapper # [['K', 3], ...]
 
-    def find_best_score(self, pop_fitness_score_list):
-        best_score = max(pop_fitness_score_list)
-        best_idx = pop_fitness_score_list.index(best_score)
+    def find_best_score(self, fitness_scores):
+        best_score = max(fitness_scores)
+        best_idx = fitness_scores.index(best_score)
         return best_score, best_idx
 
     def create_chromosome(self):
@@ -385,7 +371,6 @@ class MAGNETO:
 
         dataflow_template = self.create_dataflow_template_string(mapper)
 
-        # Read and process the model file
         with open(f'data/model/{model_name}.m', "r") as infile:
             model_lines = infile.readlines()
 
@@ -393,10 +378,8 @@ class MAGNETO:
         for line in model_lines:
             output_lines.append(line)
             if "Dimensions {" in line:
-                # Add Dataflow string after the Dimensions block
                 output_lines.append(dataflow_template)
 
-        # Write the model with mapper to the output file
         with open(output_model_path, "w") as outfile:
             outfile.writelines(output_lines)
 
@@ -416,12 +399,9 @@ class MAGNETO:
         # Pad shorter lists with None
         padded_lists = {key: lst + [None] * (max_length - len(lst)) for key, lst in lists_dict.items()}
 
-        # Save to CSV
         with open(filename, mode='w', newline='') as file:
             writer = csv.writer(file)
-            # Write header
             writer.writerow(padded_lists.keys())
-            # Write rows
             for row in zip(*padded_lists.values()):
                 writer.writerow(row)
         
@@ -447,10 +427,10 @@ class MAGNETO:
                     matching_pairs.append((i, j))
         return matching_pairs
 
-    def crossover(self, parents, crossover_prob=0.7, max_retries=5):
-        if random.random() >= crossover_prob: return parents
+    def crossover(self, chromosomes, crossover_prob=0.7, max_retries=5):
+        if random.random() >= crossover_prob: return chromosomes
 
-        parent1, parent2 = parents
+        parent1, parent2 = chromosomes
         child1 = copy.deepcopy(parent1)
         child2 = copy.deepcopy(parent2)
 
@@ -488,6 +468,7 @@ class MAGNETO:
             child1 = parent1[:6] + [['P', parent2[6][1]]] + parent1[7:]
             child2 = parent2[:6] + [['P', parent1[6][1]]] + parent2[7:]
             
+        # Check constraints
         valid_slice1 = (
             self.check_mapspace_validity(child1[:6], level='l2') and
             self.check_mapspace_validity(child1[7:], level='l1')
@@ -507,46 +488,40 @@ class MAGNETO:
             return parent1, parent2
     
     def mutate_tiles(self, chromosome, mutation_prob=0.2):
+        if random.random() >= mutation_prob: return chromosome
+        
+        dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']        
+        parent = chromosome
+        child = copy.deepcopy(parent)
         available_tile_sizes = self.get_available_tile_sizes()
-        dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']
-        max_attempts = 5
         
-        original_mapper = [gene[:] for gene in chromosome]  # Save the original state
+        # L2 Mapper mutation
+        idx_l2 = random.randint(0, 5)
+        valid_factors_l2 = available_tile_sizes['l2'][parent[idx_l2][0]]
+        if parent[idx_l2][0] in dim_list:
+            child[idx_l2][1] = random.choice(valid_factors_l2)
         
-        if random.random() < mutation_prob:
-            mutation_success = False
-            attempts = 0
+        # L1 Mapper mutation
+        idx_l1 = random.randint(7, 12)
+        valid_factors_l1 = available_tile_sizes['l1'][parent[idx_l1][0]]
+        if parent[idx_l1][0] in dim_list:
+            child[idx_l1][1] = random.choice(valid_factors_l1)
 
-            while not mutation_success and attempts < max_attempts:
-                idx_l2 = random.randint(0, 5)
-                idx_l1 = random.randint(7, 12)
-                
-                # L2 Mapper mutation
-                valid_factors_l2 = available_tile_sizes['l2'][chromosome[idx_l2][0]]
-                if chromosome[idx_l2][0] in dim_list:
-                    chromosome[idx_l2][1] = random.choice(valid_factors_l2)
-                
-                # L1 Mapper mutation
-                valid_factors_l1 = available_tile_sizes['l1'][chromosome[idx_l1][0]]
-                if chromosome[idx_l1][0] in dim_list:
-                    chromosome[idx_l1][1] = random.choice(valid_factors_l1)
-
-                # Check constraints
-                if self.check_mapspace_validity(chromosome[:6], level='l2') and \
-                self.check_mapspace_validity(chromosome[7:], level='l1'):
-                    mutation_success = True
-                else:
-                    chromosome[idx_l2][1] = original_mapper[idx_l2][1]
-                    chromosome[idx_l1][1] = original_mapper[idx_l1][1]
-                    attempts += 1
-
-            if not mutation_success:
-                chromosome[:] = original_mapper
-
-        return chromosome
+        # Check constraints
+        valid_child = (
+            self.check_mapspace_validity(child[:6], level='l2') and
+            self.check_mapspace_validity(child[7:], level='l1')
+        )
+            
+        if valid_child:
+            return child
+        else:
+            return parent
     
     def mutate_shuffle(self, chromosome, mutation_prob=0.2):
-        if random.random() < mutation_prob:
+        if random.random() >= mutation_prob: return chromosome
+        
+        if random.random() < 0.5:
             l2_mapper = chromosome[:6]
             random.shuffle(l2_mapper)
         else:
@@ -555,35 +530,23 @@ class MAGNETO:
         return chromosome
 
     def mutate_cluster(self, chromosome, mutation_prob=0.2):
+        if random.random() >= mutation_prob: return chromosome
+        
         available_pod_sizes = self.get_available_pod_sizes()
-        max_attempts = 5
-        idx1 = 6  # Pod index
+        child = copy.deepcopy(chromosome)
         
-        original_mapper = [gene[:] for gene in chromosome]  # Save the original state
-        
-        if random.random() < mutation_prob:
-            mutation_success = False
-            attempts = 0
-            
-            # Loop until a valid mutation is found
-            while not mutation_success and attempts < max_attempts:
-                chromosome[idx1][1] = random.choice(available_pod_sizes)
+        child[6][1] = random.choice(available_pod_sizes)
 
-                # Constraints validation
-                if self.check_mapspace_validity(chromosome[:6], level='l2') and \
-                self.check_mapspace_validity(chromosome[7:], level='l1'):
-                    mutation_success = True
-                attempts += 1
-
-                if not mutation_success:
-                    chromosome[idx1][1] = original_mapper[idx1][1]
-
-        return chromosome
+        # Constraints validation
+        if self.check_constraints_cluster(child[6][1]):
+            return child
+        else:
+            return chromosome
 
     def replace_population(self, population, fitness_scores, elite_ratio=0.1, random_ratio=0.2):
         """
-        - 상위 elite_ratio(%) 개체는 항상 유지 (엘리트)
-        - 나머지 개체 중에서 일부(random_ratio%)를 랜덤 선택해 새로 초기화
+        - top elite_ratio(%) maintained as is
+        - random_ratio(%) replaced with random individuals
         """
         pop_size = len(population)
         sorted_indices = sorted(range(pop_size), key=lambda i: fitness_scores[i], reverse=True)
@@ -616,31 +579,20 @@ class MAGNETO:
         last_best_fitness = -float('inf')
 
         # Evaluate the initial population
-        pop_fitness_score_list, pop_performance_list = self.evaluate_population(population)
-        best_fitness, best_idx = self.find_best_score(pop_fitness_score_list)
-        best_perf_fitness1, best_perf_fitness2, best_perf_fitness3, best_perf_fitness4 = pop_performance_list[best_idx]
+        evaluated_population = self.evaluate_population(population)
 
+        fitness_scores = [fitness for _, fitness, _ in evaluated_population]
+        best_fitness, best_idx = self.find_best_score(fitness_scores)
+        elite_individual = copy.deepcopy(population[best_idx])
+        
         for i in range(self.max_generations):
             print(f"Generation {i + 1}......")
-
-            elite_individual = population[best_idx]
-            population[0] = elite_individual
-
-            # Step0: Track stagnation and apply replacement
-            if best_fitness <= last_best_fitness:
-                no_improvement_generations += 1
-            else:
-                no_improvement_generations = 0
-                last_best_fitness = best_fitness
-            if no_improvement_generations >= 3:  # Stagnation threshold
-                population = self.replace_population(population, pop_fitness_score_list, elite_ratio=0.1, random_ratio=0.5)
-                no_improvement_generations = 0
-            
-            # Step1: Selection
+    
+            # Step 1: Selection
             selected_parents = []
             for _ in range(len(population) // 2):
-                parents = self.select_parents(population, pop_fitness_score_list)
-                selected_parents.append(parents) # len(selected_parents) == len(population) // 2
+                parents = self.select_parents(population, fitness_scores)
+                selected_parents.append(parents)
             
             # Step2: Crossover
             offspring = []
@@ -649,42 +601,59 @@ class MAGNETO:
                 child1, child2 = self.crossover([parent1, parent2], crossover_prob=0.6)
                 offspring.extend([child1, child2]) # len(offspring) == len(population)
             
-            # # Step3: Mutation
+            # Step3: Mutation
             for individual in offspring:
+                rand_value = random.random()
                 # Randomly choose between tile mutation, shuffle mutation and cluster mutation
-                if random.random() < 0.3:
-                    new_child = self.mutate_shuffle(individual, mutation_prob=0.8)
-                elif random.random() < 0.6:
+                if rand_value < 0.3:
+                    new_child = self.mutate_shuffle(individual, mutation_prob=0.5)
+                elif rand_value < 0.6:
                     new_child = self.mutate_tiles(individual, mutation_prob=0.8)
                 else:
                     new_child = self.mutate_cluster(individual, mutation_prob=0.6)
                 individual[:] = new_child
-            
+
             population = offspring
             
-            # Step4: Replacement
-            # self.replace_least_fit_individuals(population, offspring, pop_fitness_score_list)
-            worst_index = pop_fitness_score_list.index(min(pop_fitness_score_list))
+            # Step 4: Replacement
+            worst_index = fitness_scores.index(min(fitness_scores))
             population[worst_index] = elite_individual
 
-            # Evaluate the new populations
-            pop_fitness_score_list, pop_performance_list = self.evaluate_population(population)
-            best_fitness, best_idx = self.find_best_score(pop_fitness_score_list)
-            best_perf_fitness1, best_perf_fitness2, best_perf_fitness3, best_perf_fitness4 = pop_performance_list[best_idx]
+            # Step 5: Evaluate the new populations
+            evaluated_population = self.evaluate_population(population)
+            fitness_scores = [fitness for _, fitness, _ in evaluated_population]
+            performance_scores = [perf for _, _, perf in evaluated_population]
 
+            # Step 7: Identify new best individual
+            best_fitness, best_idx = self.find_best_score(fitness_scores)
+            elite_individual = copy.deepcopy(population[best_idx])  # Update elite individual
+
+            best_perf1, best_perf2, best_perf3, best_perf4 = performance_scores[best_idx]
             self.best_fitness = best_fitness
-            self.best_perf_fitness1 = best_perf_fitness1
-            self.best_perf_fitness2 = best_perf_fitness2
-            self.best_perf_fitness3 = best_perf_fitness3
-            self.best_perf_fitness4 = best_perf_fitness4
-            print(f'\tBest fitness score: {best_fitness:.4f}, Best Cycle: {best_perf_fitness1:.4f}, Best EDP: {best_perf_fitness2:.4f}, Best Memory Access: {best_perf_fitness3:.4f}, Best Reuse Factor: {best_perf_fitness4:.4f}, \n \tBest Mapper: {population[best_idx]}')
+            self.best_perf1 = best_perf1
+            self.best_perf2 = best_perf2
+            self.best_perf3 = best_perf3
+            self.best_perf4 = best_perf4
+            print(f'\tBest fitness score: {best_fitness:.4f}, Best Cycle: {best_perf1:.4f}, Best EDP: {best_perf2:.4f}, Best Memory Access: {best_perf3:.4f}, Best Reuse Factor: {best_perf4:.4f}, \n \tBest Mapper: {population[best_idx]}')
+
+            # Step 6: Track stagnation and apply replacement if needed
+            if best_fitness <= last_best_fitness:
+                no_improvement_generations += 1
+            else:
+                no_improvement_generations = 0
+                last_best_fitness = best_fitness
+            
+            if no_improvement_generations >= 3:  # Stagnation threshold
+                population = self.replace_population(population, fitness_scores, elite_ratio=0.1, random_ratio=0.3)
+                no_improvement_generations = 0
+
 
         self.save_to_csv({
             'Best Fitness Score': self.best_fitness_score_list,
-            f'Best Cycle': self.best_perf_fitness1_list,
-            f'Best EDP': self.best_perf_fitness2_list,
-            f'Best Memory Access': self.best_perf_fitness3_list,
-            f'Best Reuse Factor': self.best_perf_fitness4_list,
+            f'Best Cycle': self.best_perf1_list,
+            f'Best EDP': self.best_perf2_list,
+            f'Best Memory Access': self.best_perf3_list,
+            f'Best Reuse Factor': self.best_perf4_list,
             f'Best Mapper': self.best_mapper_list,
         }, self.model_name)
 
