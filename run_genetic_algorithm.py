@@ -15,7 +15,7 @@ class MAGNETO:
         self.hw_config = hw_config
         self.model_name = model_name
         self.num_PEs = 0
-        self.freq_MHz = 600
+        self.freq_MHz = 350
         with open(f'data/hw/{self.hw_config}.m') as f:
             for line in f:
                 if 'num_pes' in line:
@@ -37,12 +37,11 @@ class MAGNETO:
         
         self.min_cycles = float('inf')
         self.max_cycles = float('-inf')
-        self.max_weighted_memory_access = None
+        self.max_weighted_memory_access = float('-inf')
         self.min_averaged_reuse_factor = float('inf')
         self.max_averaged_reuse_factor = float('-inf')
         self.min_edp = float('inf')
         self.max_edp = float('-inf')
-        self.energy_nJ = None
         
         self.best_fitness_score_list = [] # [fitness score] * generation size
         self.best_perf1_list = [] # [metric1 value] * generation size
@@ -103,7 +102,7 @@ class MAGNETO:
     
     def evaluate_chromosome(self, chromosome):
         freq_MHz = self.freq_MHz
-        # Generate temporary mapping and run MAESTRO
+
         temp_model_with_mapping_m = self.integrate_dataflow_in_model(self.model_name, chromosome, is_temp=True)
         temp_result_csv = self.run_maestro_to_get_all_metrics(temp_model_with_mapping_m)
         
@@ -127,10 +126,6 @@ class MAGNETO:
         reuse_output_col = df.columns.get_loc(' output reuse factor')
         num_macs_col = df.columns.get_loc(' Num MACs')
         
-        # num_macs = df.columns.get_loc(' Num MACs')  input l1 read, input l1 write, filter l1 read, filter l1 write, output l1 read, output l1 write, 
-        # #input l2 read, input l2 write, filter l2 read, filter l2 write, output l2 read, output l2 write
-        
-
         # Vectorized calculations
         cycles = np.sum(data[:, runtime_col])
         onchip_energy_nJ = np.sum(data[:, energy_col])
@@ -143,22 +138,10 @@ class MAGNETO:
         averaged_reuse_factor = np.mean(
             (data[:, reuse_input_col] + data[:, reuse_filter_col] + data[:, reuse_output_col]) / 3
         )
-        dram_access_energy_nJ = np.sum(data[:, offchip_bw_col] * data[:, runtime_col] * 2 * 8 * 31.2)
 
-        # EDP calculation
-        # edp = cycles * (onchip_energy_nJ + dram_access_energy_nJ) / (freq_MHz * 1e6)  # Convert to Hz
-        edp_pJ = num_macs * 0.48 + l1_access * 0.15 + l2_access * 3.69 + dram_access * 31.2
-        edp = edp_pJ * 1e-3  # Convert to nJ
-        energy_nJ = onchip_energy_nJ + dram_access_energy_nJ
-
-        # Weighted memory access calculation
+        dram_access_energy_nJ = np.sum(data[:, offchip_bw_col] * data[:, runtime_col]) * 2 * 8 * 31.2 * 1e-3 # pJ to nJ
+        edp_nJ = num_macs * 0.48 + l1_access * 0.15 + l2_access * 3.69 + dram_access * 31.2 * 1e-3
         weighted_memory_access = l1_access + 5 * l2_access + 10 * dram_access
-
-        # Power proxy calculation
-        power_proxy_value_mW = (onchip_energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6 * 1e3 # nJ to J / MHz to Hz / W to mW
-        if cycles <= 0:
-            print("Invalid value for cycles: must be greater than 0.")
-            power_proxy_value_mW = float('inf')  # Set to infinity if invalid        
 
         # Normalize the values
         self.min_cycles = min(self.min_cycles or 0, cycles)
@@ -166,28 +149,25 @@ class MAGNETO:
         self.max_weighted_memory_access = max(self.max_weighted_memory_access or 0, weighted_memory_access)
         self.min_averaged_reuse_factor = min(self.min_averaged_reuse_factor or 0, averaged_reuse_factor)
         self.max_averaged_reuse_factor = max(self.max_averaged_reuse_factor or 0, averaged_reuse_factor)
-        self.min_edp = min(self.min_edp, edp)
-        self.max_edp = max(self.max_edp, edp)
-        self.energy_nJ = max(self.energy_nJ or 0, energy_nJ)
+        self.min_edp = min(self.min_edp, edp_nJ)
+        self.max_edp = max(self.max_edp, edp_nJ)
 
         norm_cycles = np.log(cycles + 1) / np.log(self.max_cycles + 1)
         # norm_cycles = (cycles - self.min_cycles) / (self.max_cycles - self.min_cycles + 1e-9)
-
-        norm_weighted_memory_access = (weighted_memory_access - 1) / (self.max_weighted_memory_access + 1)
-        # norm_averaged_reuse_factor = averaged_reuse_factor / self.max_averaged_reuse_factor
+        # norm_weighted_memory_access = (weighted_memory_access - 1) / (self.max_weighted_memory_access + 1)
         norm_averaged_reuse_factor = (averaged_reuse_factor - self.min_averaged_reuse_factor) / (self.max_averaged_reuse_factor - self.min_averaged_reuse_factor + 1e-9)
+        norm_edp = (edp_nJ - self.min_edp) / (self.max_edp - self.min_edp + 1e-9)
 
-        # norm_edp = edp / self.max_edp
-        norm_edp = (edp - self.min_edp) / (self.max_edp - self.min_edp + 1e-9)
-
-        norm_energy = energy_nJ / self.energy_nJ
-
-        # Fitness score calculation
+        # Fitness score
         offset = 5
-        # fitness_score = 0.3 * norm_averaged_reuse_factor - 0.5 * norm_edp - 0.2 * norm_weighted_memory_access + offset
-        fitness_score = - 0.7 * norm_edp + 0.3 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
-        print(f"power_proxy_value_mW: {power_proxy_value_mW} mW")
+        fitness_score = - 0.6 * norm_edp + 0.4 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
+        
+        # Power proxy calculation
+        leakage_mW = 100 
+        power_proxy_value_mW = (onchip_energy_nJ + dram_access_energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6 * 1e3
+        power_proxy_value_mW = float('inf') if cycles <= 0 else power_proxy_value_mW # Set to infinity if invalid cycles
         if power_proxy_value_mW > self.power_constraint:
+            print(f"power_proxy_value_mW: {power_proxy_value_mW} mW")
             fitness_score += -100
             
         # Cleanup temporary files
@@ -196,7 +176,7 @@ class MAGNETO:
         if os.path.exists(temp_result_csv):
             os.remove(temp_result_csv)
 
-        return fitness_score, (cycles, edp, weighted_memory_access, averaged_reuse_factor, power_proxy_value_mW)
+        return fitness_score, (cycles, edp_nJ, weighted_memory_access, averaged_reuse_factor, power_proxy_value_mW)
 
     def evaluate_population(self, population):
         evaluated_pop = []
