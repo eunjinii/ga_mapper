@@ -15,7 +15,7 @@ class MAGNETO:
         self.hw_config = hw_config
         self.model_name = model_name
         self.num_PEs = 0
-        self.freq_MHz = 350
+        self.freq_MHz = 600
         with open(f'data/hw/{self.hw_config}.m') as f:
             for line in f:
                 if 'num_pes' in line:
@@ -33,11 +33,15 @@ class MAGNETO:
         self.best_perf2 = 0 # utilization
         self.best_perf3 = float('inf') # memory access
         self.best_perf4 = 0 # reuse factor
+        self.best_perf5 = 0 # reuse factor
         
-        self.max_cycles = None
+        self.min_cycles = float('inf')
+        self.max_cycles = float('-inf')
         self.max_weighted_memory_access = None
-        self.max_averaged_reuse_factor = None
-        self.max_edp = None
+        self.min_averaged_reuse_factor = float('inf')
+        self.max_averaged_reuse_factor = float('-inf')
+        self.min_edp = float('inf')
+        self.max_edp = float('-inf')
         self.energy_nJ = None
         
         self.best_fitness_score_list = [] # [fitness score] * generation size
@@ -45,6 +49,7 @@ class MAGNETO:
         self.best_perf2_list = []
         self.best_perf3_list = []
         self.best_perf4_list = []
+        self.best_perf5_list = []
         self.best_mapper_list = []
 
     def run_maestro_to_get_all_metrics(self, mapping_file_path):
@@ -120,10 +125,16 @@ class MAGNETO:
         reuse_input_col = df.columns.get_loc(' input reuse factor')
         reuse_filter_col = df.columns.get_loc(' filter reuse factor')
         reuse_output_col = df.columns.get_loc(' output reuse factor')
+        num_macs_col = df.columns.get_loc(' Num MACs')
+        
+        # num_macs = df.columns.get_loc(' Num MACs')  input l1 read, input l1 write, filter l1 read, filter l1 write, output l1 read, output l1 write, 
+        # #input l2 read, input l2 write, filter l2 read, filter l2 write, output l2 read, output l2 write
+        
 
         # Vectorized calculations
         cycles = np.sum(data[:, runtime_col])
         onchip_energy_nJ = np.sum(data[:, energy_col])
+        num_macs = np.sum(data[:, num_macs_col])
         l1_access = np.sum(data[:, l1_read_col] + data[:, l1_write_col] +
                         data[:, filter_read_col] + data[:, filter_write_col] +
                         data[:, output_read_col] + data[:, output_write_col])
@@ -132,48 +143,60 @@ class MAGNETO:
         averaged_reuse_factor = np.mean(
             (data[:, reuse_input_col] + data[:, reuse_filter_col] + data[:, reuse_output_col]) / 3
         )
-        dram_access_energy_nJ = np.sum(data[:, offchip_bw_col] * data[:, runtime_col] * 2 * 8 * 30)
+        dram_access_energy_nJ = np.sum(data[:, offchip_bw_col] * data[:, runtime_col] * 2 * 8 * 31.2)
 
         # EDP calculation
-        edp = cycles * (onchip_energy_nJ + dram_access_energy_nJ) / (freq_MHz * 1e6)  # Convert to Hz
+        # edp = cycles * (onchip_energy_nJ + dram_access_energy_nJ) / (freq_MHz * 1e6)  # Convert to Hz
+        edp_pJ = num_macs * 0.48 + l1_access * 0.15 + l2_access * 3.69 + dram_access * 31.2
+        edp = edp_pJ * 1e-3  # Convert to nJ
         energy_nJ = onchip_energy_nJ + dram_access_energy_nJ
 
         # Weighted memory access calculation
         weighted_memory_access = l1_access + 5 * l2_access + 10 * dram_access
 
         # Power proxy calculation
-        power_proxy_value = (onchip_energy_nJ + dram_access_energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6
+        power_proxy_value_mW = (onchip_energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6 * 1e3 # nJ to J / MHz to Hz / W to mW
+        if cycles <= 0:
+            print("Invalid value for cycles: must be greater than 0.")
+            power_proxy_value_mW = float('inf')  # Set to infinity if invalid        
 
         # Normalize the values
+        self.min_cycles = min(self.min_cycles or 0, cycles)
         self.max_cycles = max(self.max_cycles or 0, cycles)
         self.max_weighted_memory_access = max(self.max_weighted_memory_access or 0, weighted_memory_access)
+        self.min_averaged_reuse_factor = min(self.min_averaged_reuse_factor or 0, averaged_reuse_factor)
         self.max_averaged_reuse_factor = max(self.max_averaged_reuse_factor or 0, averaged_reuse_factor)
-        self.max_edp = max(self.max_edp or 0, edp)
+        self.min_edp = min(self.min_edp, edp)
+        self.max_edp = max(self.max_edp, edp)
         self.energy_nJ = max(self.energy_nJ or 0, energy_nJ)
 
         norm_cycles = np.log(cycles + 1) / np.log(self.max_cycles + 1)
+        # norm_cycles = (cycles - self.min_cycles) / (self.max_cycles - self.min_cycles + 1e-9)
+
         norm_weighted_memory_access = (weighted_memory_access - 1) / (self.max_weighted_memory_access + 1)
-        norm_averaged_reuse_factor = averaged_reuse_factor / self.max_averaged_reuse_factor
-        norm_edp = edp / self.max_edp
+        # norm_averaged_reuse_factor = averaged_reuse_factor / self.max_averaged_reuse_factor
+        norm_averaged_reuse_factor = (averaged_reuse_factor - self.min_averaged_reuse_factor) / (self.max_averaged_reuse_factor - self.min_averaged_reuse_factor + 1e-9)
+
+        # norm_edp = edp / self.max_edp
+        norm_edp = (edp - self.min_edp) / (self.max_edp - self.min_edp + 1e-9)
+
         norm_energy = energy_nJ / self.energy_nJ
 
         # Fitness score calculation
         offset = 5
         # fitness_score = 0.3 * norm_averaged_reuse_factor - 0.5 * norm_edp - 0.2 * norm_weighted_memory_access + offset
-        fitness_score = - 0.7 * norm_cycles + 0.3 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
-        # if power_proxy_value > self.power_constraint:
-        #     fitness_score = -100
-        if power_proxy_value > self.power_constraint:
-            fitness_score -= ((power_proxy_value - self.power_constraint) / self.power_constraint) * 10
-
-
+        fitness_score = - 0.7 * norm_edp + 0.3 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
+        print(f"power_proxy_value_mW: {power_proxy_value_mW} mW")
+        if power_proxy_value_mW > self.power_constraint:
+            fitness_score += -100
+            
         # Cleanup temporary files
         if os.path.exists(temp_model_with_mapping_m):
             os.remove(temp_model_with_mapping_m)
         if os.path.exists(temp_result_csv):
             os.remove(temp_result_csv)
 
-        return fitness_score, (cycles, edp, weighted_memory_access, averaged_reuse_factor)
+        return fitness_score, (cycles, edp, weighted_memory_access, averaged_reuse_factor, power_proxy_value_mW)
 
     def evaluate_population(self, population):
         evaluated_pop = []
@@ -188,6 +211,7 @@ class MAGNETO:
         self.best_perf2_list.append(evaluated_pop[best_idx][2][1])
         self.best_perf3_list.append(evaluated_pop[best_idx][2][2])
         self.best_perf4_list.append(evaluated_pop[best_idx][2][3])
+        self.best_perf5_list.append(evaluated_pop[best_idx][2][4])
             
         return evaluated_pop # [(chromosome, fitness, (per1, perf2)), ...]
 
@@ -427,7 +451,7 @@ class MAGNETO:
                     matching_pairs.append((i, j))
         return matching_pairs
 
-    def crossover(self, chromosomes, crossover_prob=0.7, max_retries=5):
+    def crossover(self, chromosomes, crossover_prob=0.7):
         if random.random() >= crossover_prob: return chromosomes
 
         parent1, parent2 = chromosomes
@@ -487,9 +511,18 @@ class MAGNETO:
         else:
             return parent1, parent2
     
-    def mutate_tiles(self, chromosome, mutation_prob=0.2):
+    def mutation(self, chromosome, mutation_prob=0.6):
         if random.random() >= mutation_prob: return chromosome
         
+        rand_value = random.random()
+        if rand_value < 0.3:
+            return self.mutate_shuffle(chromosome)
+        elif rand_value < 0.6:
+            return self.mutate_tiles(chromosome)
+        else:
+            return self.mutate_cluster(chromosome)
+    
+    def mutate_tiles(self, chromosome):
         dim_list = ['K', 'C', 'Y', 'X', 'R', 'S']        
         parent = chromosome
         child = copy.deepcopy(parent)
@@ -518,30 +551,28 @@ class MAGNETO:
         else:
             return parent
     
-    def mutate_shuffle(self, chromosome, mutation_prob=0.2):
-        if random.random() >= mutation_prob: return chromosome
-        
-        if random.random() < 0.5:
+    def mutate_shuffle(self, chromosome):
+        if random.random() < 0.6:
             l2_mapper = chromosome[:6]
             random.shuffle(l2_mapper)
-        else:
+        if random.random() < 0.6:
             l1_mapper = chromosome[7:]
             random.shuffle(l1_mapper)
         return chromosome
 
-    def mutate_cluster(self, chromosome, mutation_prob=0.2):
-        if random.random() >= mutation_prob: return chromosome
-        
+    def mutate_cluster(self, chromosome):
         available_pod_sizes = self.get_available_pod_sizes()
-        child = copy.deepcopy(chromosome)
+        parent = chromosome
+        child = copy.deepcopy(parent)
         
-        child[6][1] = random.choice(available_pod_sizes)
+        new_pod_size = random.choice(available_pod_sizes)
+        child[6][1] = new_pod_size
 
         # Constraints validation
-        if self.check_constraints_cluster(child[6][1]):
+        if self.check_constraints_cluster(new_pod_size):
             return child
         else:
-            return chromosome
+            return parent
 
     def replace_population(self, population, fitness_scores, elite_ratio=0.1, random_ratio=0.2):
         """
@@ -597,20 +628,12 @@ class MAGNETO:
             # Step2: Crossover
             offspring = []
             for parent1, parent2 in selected_parents: # len(population) // 2 times
-                # Randomly choose between inter-level, intra-level and cluster crossover
                 child1, child2 = self.crossover([parent1, parent2], crossover_prob=0.6)
                 offspring.extend([child1, child2]) # len(offspring) == len(population)
             
             # Step3: Mutation
             for individual in offspring:
-                rand_value = random.random()
-                # Randomly choose between tile mutation, shuffle mutation and cluster mutation
-                if rand_value < 0.3:
-                    new_child = self.mutate_shuffle(individual, mutation_prob=0.5)
-                elif rand_value < 0.6:
-                    new_child = self.mutate_tiles(individual, mutation_prob=0.8)
-                else:
-                    new_child = self.mutate_cluster(individual, mutation_prob=0.6)
+                new_child = self.mutation(individual, mutation_prob=0.7)
                 individual[:] = new_child
 
             population = offspring
@@ -624,19 +647,20 @@ class MAGNETO:
             fitness_scores = [fitness for _, fitness, _ in evaluated_population]
             performance_scores = [perf for _, _, perf in evaluated_population]
 
-            # Step 7: Identify new best individual
+            # Step 6: Identify new best individual
             best_fitness, best_idx = self.find_best_score(fitness_scores)
             elite_individual = copy.deepcopy(population[best_idx])  # Update elite individual
 
-            best_perf1, best_perf2, best_perf3, best_perf4 = performance_scores[best_idx]
+            best_perf1, best_perf2, best_perf3, best_perf4, best_perf5 = performance_scores[best_idx]
             self.best_fitness = best_fitness
             self.best_perf1 = best_perf1
             self.best_perf2 = best_perf2
             self.best_perf3 = best_perf3
             self.best_perf4 = best_perf4
-            print(f'\tBest fitness score: {best_fitness:.4f}, Best Cycle: {best_perf1:.4f}, Best EDP: {best_perf2:.4f}, Best Memory Access: {best_perf3:.4f}, Best Reuse Factor: {best_perf4:.4f}, \n \tBest Mapper: {population[best_idx]}')
+            self.best_perf5 = best_perf5
+            print(f'\tFitness: {best_fitness:.4f}, Cycle: {best_perf1:.4f}, EDP: {best_perf2:.4f}, Memory Access: {best_perf3:.4f}, Reuse Factor: {best_perf4:.4f}, Power Proxy: {best_perf5:.4f}, \n \tBest Mapper: {population[best_idx]}')
 
-            # Step 6: Track stagnation and apply replacement if needed
+            # Step 7: Track stagnation and apply replacement if needed
             if best_fitness <= last_best_fitness:
                 no_improvement_generations += 1
             else:
@@ -647,13 +671,13 @@ class MAGNETO:
                 population = self.replace_population(population, fitness_scores, elite_ratio=0.1, random_ratio=0.3)
                 no_improvement_generations = 0
 
-
         self.save_to_csv({
             'Best Fitness Score': self.best_fitness_score_list,
             f'Best Cycle': self.best_perf1_list,
             f'Best EDP': self.best_perf2_list,
             f'Best Memory Access': self.best_perf3_list,
             f'Best Reuse Factor': self.best_perf4_list,
+            f'Best Power Proxy': self.best_perf5_list,
             f'Best Mapper': self.best_mapper_list,
         }, self.model_name)
 
@@ -666,7 +690,7 @@ if __name__ == "__main__":
     parser.add_argument('--population', type=int, default=10, help='Number of populations')
     parser.add_argument('--model_name', type=str, default='single_conv', help='Model defined in data/model in MAESTO format')
     parser.add_argument('--hwconfig', type=str, default='mobile', choices=('mobile', 'cloud'), help='Hardware config defined in data/hw in MAESTRO format')
-    parser.add_argument('--power_budget_mw', type=int, default='1000', help='Power budget in mW')
+    parser.add_argument('--power_budget_mw', type=int, default='450', help='Power budget in mW, Eyeriss 450mW')
     args = parser.parse_args()
     
     # Run the Genetic Algorithm
