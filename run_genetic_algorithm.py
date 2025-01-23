@@ -110,37 +110,42 @@ class MAGNETO:
         df = pd.read_csv(temp_result_csv)
         data = df.to_numpy()
 
-        runtime_col = df.columns.get_loc(' Runtime (Cycles)')
-        energy_col = df.columns.get_loc(' Activity count-based Energy (nJ)')
-        l1_read_col = df.columns.get_loc(' input l1 read')
-        l1_write_col = df.columns.get_loc(' input l1 write')
-        filter_read_col = df.columns.get_loc('filter l1 read')
-        filter_write_col = df.columns.get_loc(' filter l1 write')
-        output_read_col = df.columns.get_loc('output l1 read')
-        output_write_col = df.columns.get_loc(' output l1 write')
-        l2_read_col = df.columns.get_loc(' input l2 read')
-        l2_write_col = df.columns.get_loc(' input l2 write')
-        offchip_bw_col = df.columns.get_loc(' Offchip BW Req (Elements/cycle)')
-        reuse_input_col = df.columns.get_loc(' input reuse factor')
-        reuse_filter_col = df.columns.get_loc(' filter reuse factor')
-        reuse_output_col = df.columns.get_loc(' output reuse factor')
-        num_macs_col = df.columns.get_loc(' Num MACs')
-        
+        col_indices = {col: df.columns.get_loc(col) for col in [
+            ' Runtime (Cycles)', ' input l1 read', ' input l1 write', 'filter l1 read', ' filter l1 write', 
+            'output l1 read', ' output l1 write', ' input l2 read', ' input l2 write', 
+            ' filter l2 read', ' filter l2 write', ' output l2 read', ' output l2 write', 
+            ' Offchip BW Req (Elements/cycle)', ' input reuse factor', 
+            ' filter reuse factor', ' output reuse factor', ' Num MACs']}
+
         # Vectorized calculations
-        cycles = np.sum(data[:, runtime_col])
-        onchip_energy_nJ = np.sum(data[:, energy_col])
-        num_macs = np.sum(data[:, num_macs_col])
-        l1_access = np.sum(data[:, l1_read_col] + data[:, l1_write_col] +
-                        data[:, filter_read_col] + data[:, filter_write_col] +
-                        data[:, output_read_col] + data[:, output_write_col])
-        l2_access = np.sum(data[:, l2_read_col] + data[:, l2_write_col])
-        dram_access = np.sum(data[:, offchip_bw_col] * data[:, runtime_col])
+        cycles = np.sum(data[:, col_indices[' Runtime (Cycles)']])
+        num_macs = np.sum(data[:, col_indices[' Num MACs']])
+        l1_access = np.sum(
+            data[:, [col_indices[key] for key in [
+                ' input l1 read', ' input l1 write', 'filter l1 read', ' filter l1 write',
+                'output l1 read', ' output l1 write'
+            ]]].sum(axis=1)
+        )
+        l2_access = np.sum(
+            data[:, [col_indices[key] for key in [
+                ' input l2 read', ' input l2 write', ' filter l2 read', ' filter l2 write',
+                ' output l2 read', ' output l2 write'
+            ]]].sum(axis=1)
+        )
+        dram_access = np.sum(
+            data[:, col_indices[' Offchip BW Req (Elements/cycle)']] * 
+            data[:, col_indices[' Runtime (Cycles)']]
+        )
         averaged_reuse_factor = np.mean(
-            (data[:, reuse_input_col] + data[:, reuse_filter_col] + data[:, reuse_output_col]) / 3
+            data[:, [col_indices[key] for key in [
+                ' input reuse factor', ' filter reuse factor', ' output reuse factor'
+            ]]].mean(axis=1)
         )
 
-        dram_access_energy_nJ = np.sum(data[:, offchip_bw_col] * data[:, runtime_col]) * 2 * 8 * 31.2 * 1e-3 # pJ to nJ
-        edp_nJ = num_macs * 0.48 + l1_access * 0.15 + l2_access * 3.69 + dram_access * 31.2 * 1e-3
+        # dram_access_energy_nJ = np.sum(data[:, offchip_bw_col] * data[:, runtime_col]) *31.2 * 1e-3 # pJ to nJ
+        energy_nJ = num_macs * 0.48 + l1_access * 0.15 + l2_access * 3.69 + dram_access * 31.2 * 1e-3
+        delay_s = cycles / (freq_MHz * 1e6)
+        edp_nJ = energy_nJ * delay_s
         weighted_memory_access = l1_access + 5 * l2_access + 10 * dram_access
 
         # Normalize the values
@@ -152,22 +157,23 @@ class MAGNETO:
         self.min_edp = min(self.min_edp, edp_nJ)
         self.max_edp = max(self.max_edp, edp_nJ)
 
-        norm_cycles = np.log(cycles + 1) / np.log(self.max_cycles + 1)
-        # norm_cycles = (cycles - self.min_cycles) / (self.max_cycles - self.min_cycles + 1e-9)
+        # norm_cycles = np.log(cycles + 1) / np.log(self.max_cycles + 1)
+        norm_cycles = (cycles - self.min_cycles) / (self.max_cycles - self.min_cycles + 1e-9)
         # norm_weighted_memory_access = (weighted_memory_access - 1) / (self.max_weighted_memory_access + 1)
         norm_averaged_reuse_factor = (averaged_reuse_factor - self.min_averaged_reuse_factor) / (self.max_averaged_reuse_factor - self.min_averaged_reuse_factor + 1e-9)
-        norm_edp = (edp_nJ - self.min_edp) / (self.max_edp - self.min_edp + 1e-9)
+        norm_edp = (edp_nJ - self.min_edp) / (self.max_edp - self.min_edp + 1e-9) if self.max_edp > self.min_edp else 1
 
         # Fitness score
         offset = 5
-        fitness_score = - 0.6 * norm_edp + 0.4 * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
+        alpha = 0.7
+        fitness_score = - alpha * norm_edp + (1-alpha) * norm_averaged_reuse_factor + offset # reuse_factor increases as memory access decreases
         
         # Power proxy calculation
         leakage_mW = 100 
-        power_proxy_value_mW = (onchip_energy_nJ + dram_access_energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6 * 1e3
-        power_proxy_value_mW = float('inf') if cycles <= 0 else power_proxy_value_mW # Set to infinity if invalid cycles
+        power_proxy_value_mW = (energy_nJ) / cycles * freq_MHz * 1e-9 * 1e6 * 1e3 + leakage_mW
+        power_proxy_value_mW = float('inf') if cycles <= 0 else power_proxy_value_mW
         if power_proxy_value_mW > self.power_constraint:
-            print(f"power_proxy_value_mW: {power_proxy_value_mW} mW")
+            # print(f"Power proxy exceeds: {power_proxy_value_mW:.4f} mW")
             fitness_score += -100
             
         # Cleanup temporary files
@@ -577,8 +583,8 @@ class MAGNETO:
         print(f"Restarted {num_to_restart} individuals; kept top {elite_count} elites.")
         return population
 
-    def run_ga(self, dimensions): 
-        self.dimensions = dimensions[0]
+    def run_ga(self, dimensions):
+        self.dimensions = dimensions[-1]
         population = self.initialize_population()
         best_fitness, best_idx = -1, -1
 
